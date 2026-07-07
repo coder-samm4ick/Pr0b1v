@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-ENIGMA SEARCH PARSER v2.0
-ТОКЕН: 8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0
-Лимит: 100 запросов/день
+ENIGMA SEARCH PARSER v3.0 - РЕАЛЬНЫЙ ПАРСИНГ ПО НОМЕРУ
+Ищет отчёты через Google и парсит их автоматически
 """
 
 import asyncio
@@ -12,44 +11,32 @@ import aiohttp
 import json
 import re
 import sqlite3
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
 import logging
-from collections import defaultdict
+from urllib.parse import quote_plus
 
 # ========== КОНФИГУРАЦИЯ ==========
-MAX_REQUESTS_PER_DAY = 100
+MAX_REQUESTS_PER_DAY = 1000
 DB_PATH = "enigma_parser.db"
-BOT_TOKEN = "8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0"  # <--- ТВОЙ ТОКЕН
+BOT_TOKEN = "8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0"
 
-# ========== НАСТРОЙКА ЛОГГИНГА ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ========== БАЗА ДАННЫХ ==========
 
 def init_db():
-    """Инициализация базы данных"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
-    # Таблица запросов (для лимита)
     c.execute('''CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         query TEXT NOT NULL,
-        query_type TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         success BOOLEAN DEFAULT 0,
         report_id TEXT
     )''')
-    
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_query ON requests(query)')
-    
-    # Таблица для хранения спарсенных данных
     c.execute('''CREATE TABLE IF NOT EXISTS parsed_data (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_id TEXT UNIQUE,
@@ -63,62 +50,46 @@ def init_db():
         addresses TEXT,
         card TEXT,
         telegram TEXT,
-        other_data TEXT,
         parsed_at TEXT
     )''')
-    
-    # Таблица статистики
     c.execute('''CREATE TABLE IF NOT EXISTS stats (
         stat_key TEXT PRIMARY KEY,
         stat_value TEXT
     )''')
-    
     c.execute("INSERT OR IGNORE INTO stats (stat_key, stat_value) VALUES (?, ?)",
               ("total_parsed", "0"))
-    c.execute("INSERT OR IGNORE INTO stats (stat_key, stat_value) VALUES (?, ?)",
-              ("last_reset", datetime.now().isoformat()))
-    
     conn.commit()
     conn.close()
     logger.info("Database initialized")
 
-# ========== КЛАСС ДЛЯ ЛИМИТА ==========
+# ========== ЛИМИТЕР ==========
 
 class RateLimiter:
-    """Лимит 100 запросов в день"""
-    
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
+    def __init__(self):
         self.max_requests = MAX_REQUESTS_PER_DAY
     
     def get_today_requests(self) -> int:
-        today = date.today().isoformat()
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM requests WHERE date(timestamp) = ?", (today,))
+        c.execute("SELECT COUNT(*) FROM requests WHERE date(timestamp) = ?", (date.today().isoformat(),))
         count = c.fetchone()[0]
         conn.close()
         return count
     
     def can_make_request(self) -> Tuple[bool, int, int]:
-        today_requests = self.get_today_requests()
-        remaining = self.max_requests - today_requests
-        if remaining <= 0:
-            return False, today_requests, remaining
-        return True, today_requests, remaining
+        used = self.get_today_requests()
+        remaining = self.max_requests - used
+        return remaining > 0, used, remaining
     
-    def log_request(self, query: str, query_type: str, success: bool = False, report_id: str = None):
-        conn = sqlite3.connect(self.db_path)
+    def log_request(self, query: str, success: bool = False, report_id: str = None):
+        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute(
-            """INSERT INTO requests (query, query_type, timestamp, success, report_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (query, query_type, datetime.now().isoformat(), success, report_id)
-        )
+        c.execute("INSERT INTO requests (query, timestamp, success, report_id) VALUES (?, ?, ?, ?)",
+                  (query, datetime.now().isoformat(), success, report_id))
         conn.commit()
         conn.close()
 
-# ========== ОСНОВНОЙ ПАРСЕР ==========
+# ========== ПАРСЕР ==========
 
 class EnigmaParser:
     def __init__(self):
@@ -140,35 +111,86 @@ class EnigmaParser:
         if self.session:
             await self.session.close()
     
+    async def search_by_phone(self, phone: str) -> Dict:
+        """ПОИСК ОТЧЁТА ПО НОМЕРУ ЧЕРЕЗ GOOGLE"""
+        clean_phone = re.sub(r'\D', '', phone)
+        
+        # Проверяем, есть ли уже в БД
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT report_id, phone FROM parsed_data WHERE phone LIKE ?", (f"%{clean_phone}%",))
+        existing = c.fetchone()
+        conn.close()
+        
+        if existing:
+            logger.info(f"Found existing data for {clean_phone}")
+            return await self.fetch_report(existing[0])
+        
+        # Ищем через Google
+        search_queries = [
+            f'site:enigmasearch.org "{clean_phone}"',
+            f'"{clean_phone}" enigmasearch',
+            f'"{clean_phone}" report enigma'
+        ]
+        
+        for query in search_queries:
+            google_url = f"https://www.google.com/search?q={quote_plus(query)}"
+            
+            try:
+                async with self.session.get(google_url) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        # Ищем ссылки на отчёты EnigmaSearch
+                        report_links = re.findall(
+                            r'https://enigmasearch\.org/report/[0-9a-f-]+',
+                            html
+                        )
+                        if report_links:
+                            report_id = report_links[0].split('/')[-1]
+                            logger.info(f"Found report: {report_id} for phone {clean_phone}")
+                            return await self.fetch_report(report_id)
+            except Exception as e:
+                logger.error(f"Search error: {e}")
+                continue
+        
+        return {
+            "error": "Отчёт не найден",
+            "phone": clean_phone,
+            "search_links": [
+                f"https://google.com/search?q={clean_phone}+enigmasearch",
+                f"https://enigmasearch.org/search?q={clean_phone}"
+            ]
+        }
+    
     async def fetch_report(self, report_id: str) -> Dict:
+        """ПАРСИНГ ОТЧЁТА ПО ID"""
+        
         can, used, remaining = self.rate_limiter.can_make_request()
         if not can:
-            return {
-                "error": f"Лимит превышен! Использовано {used}/{MAX_REQUESTS_PER_DAY}",
-                "limit_reached": True,
-                "used": used,
-                "max": MAX_REQUESTS_PER_DAY
-            }
+            return {"error": f"Лимит! {used}/{MAX_REQUESTS_PER_DAY}"}
         
-        logger.info(f"Fetching report: {report_id} (осталось: {remaining})")
         url = f"{self.base_url}/report/{report_id}"
+        logger.info(f"Fetching: {url}")
         
         try:
             async with self.session.get(url) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    result = self.parse_html(html, report_id)
-                    self.rate_limiter.log_request(report_id, "report_id", success=True, report_id=report_id)
-                    self.save_to_db(result)
-                    return result
-                else:
-                    self.rate_limiter.log_request(report_id, "report_id", success=False)
-                    return {"error": f"HTTP {resp.status}", "report_id": report_id}
+                if resp.status != 200:
+                    self.rate_limiter.log_request(report_id, success=False)
+                    return {"error": f"HTTP {resp.status}"}
+                
+                html = await resp.text()
+                result = self.parse_html(html, report_id)
+                self.rate_limiter.log_request(report_id, success=True, report_id=report_id)
+                self.save_to_db(result)
+                return result
+                
         except Exception as e:
-            self.rate_limiter.log_request(report_id, "report_id", success=False)
-            return {"error": str(e), "report_id": report_id}
+            self.rate_limiter.log_request(report_id, success=False)
+            return {"error": str(e)}
     
     def parse_html(self, html: str, report_id: str) -> Dict:
+        """ПАРСИНГ ВСЕЙ ИНФЫ ИЗ HTML"""
+        
         result = {
             "report_id": report_id,
             "url": f"https://enigmasearch.org/report/{report_id}",
@@ -176,64 +198,81 @@ class EnigmaParser:
             "data": {}
         }
         
+        d = result["data"]
+        
         # Телефон
         phone_match = re.search(r'Телефон:\s*(\+?\d{10,15})', html)
         if phone_match:
-            result["data"]["phone"] = phone_match.group(1)
+            d["phone"] = phone_match.group(1)
         
         # Оператор
-        operator_match = re.search(r'Оператор связи:\s*([А-Яа-я\s\-]+)', html)
-        if operator_match:
-            result["data"]["operator"] = operator_match.group(1).strip()
+        op_match = re.search(r'Оператор связи:\s*([А-Яа-я\s\-]+)', html)
+        if op_match:
+            d["operator"] = op_match.group(1).strip()
         
         # Регион
-        region_match = re.search(r'Регион:\s*([А-Яа-я\s\-]+)', html)
-        if region_match:
-            result["data"]["region"] = region_match.group(1).strip()
+        reg_match = re.search(r'Регион:\s*([А-Яа-я\s\-]+)', html)
+        if reg_match:
+            d["region"] = reg_match.group(1).strip()
         
-        # Личности
+        # Личности (ФИО)
         personalities = []
-        matches = re.findall(r'\[(\d+)\]\s*([А-Я][а-я]+\s[А-Я][а-я]+\s[А-Я][а-я]+)', html)
-        for count, name in matches:
-            personalities.append({"count": int(count), "name": name.strip()})
+        # Ищем в формате [10] Залиева Наталья Владимировна
+        for match in re.finditer(r'\[(\d+)\]\s*([А-Я][а-я]+\s[А-Я][а-я]+\s[А-Я][а-я]+)', html):
+            personalities.append({
+                "count": int(match.group(1)),
+                "name": match.group(2).strip()
+            })
         if personalities:
-            result["data"]["personalities"] = personalities
+            d["personalities"] = personalities
         
         # Email
         emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
         if emails:
-            result["data"]["emails"] = list(set(emails))
+            d["emails"] = list(set(emails))
         
         # СНИЛС
         snils = re.findall(r'СНИЛС:\s*\[?(\d{11})\]?', html)
         if snils:
-            result["data"]["snils"] = list(set(snils))
+            d["snils"] = list(set(snils))
         
         # ИНН
         inns = re.findall(r'ИНН:\s*\[?(\d{10,12})\]?', html)
         if inns:
-            result["data"]["inn"] = list(set(inns))
+            d["inn"] = list(set(inns))
         
         # Адреса
-        addresses = re.findall(r'(\d{6}[,.]?\s*[Рр]осси[яи].*?(?:\n|$))', html)
+        addresses = []
+        for addr in re.findall(r'(\d{6}[,.]?\s*[Рр]осси[яи][^\n]{0,200})', html):
+            addr = addr.strip()
+            if addr and len(addr) > 10 and addr not in addresses:
+                addresses.append(addr)
         if addresses:
-            result["data"]["addresses"] = [addr.strip() for addr in addresses[:5]]
+            d["addresses"] = addresses[:5]
         
-        # Банковские карты
+        # Карты
         cards = re.findall(r'Номер карты:\s*(\d{4}\*{4,8}\d{4})', html)
         if cards:
-            result["data"]["cards"] = list(set(cards))
+            d["cards"] = list(set(cards))
         
         # Telegram
         tg_links = re.findall(r'https://t\.me/([^\s\'"]+)', html)
         if tg_links:
-            result["data"]["telegram_links"] = [f"https://t.me/{t}" for t in set(tg_links)]
+            d["telegram_links"] = [f"https://t.me/{t}" for t in set(tg_links)]
+        
+        # Дополнительная инфа
+        if re.search(r'СНИЛС:', html):
+            d["has_snils"] = True
+        if re.search(r'ИНН:', html):
+            d["has_inn"] = True
         
         # Статистика
         result["statistics"] = {
-            "total_personalities": len(result["data"].get("personalities", [])),
-            "total_emails": len(result["data"].get("emails", [])),
-            "total_addresses": len(result["data"].get("addresses", []))
+            "personalities": len(d.get("personalities", [])),
+            "emails": len(d.get("emails", [])),
+            "addresses": len(d.get("addresses", [])),
+            "snils": len(d.get("snils", [])),
+            "inn": len(d.get("inn", []))
         }
         
         return result
@@ -242,11 +281,12 @@ class EnigmaParser:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         d = data.get("data", {})
+        
         c.execute(
             """INSERT OR REPLACE INTO parsed_data 
                (report_id, phone, operator, region, personalities, emails, 
-                snils, inn, addresses, card, telegram, other_data, parsed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                snils, inn, addresses, card, telegram, parsed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 data.get("report_id"),
                 d.get("phone"),
@@ -259,17 +299,14 @@ class EnigmaParser:
                 json.dumps(d.get("addresses", [])),
                 json.dumps(d.get("cards", [])),
                 json.dumps(d.get("telegram_links", [])),
-                json.dumps({k: v for k, v in d.items() if k not in [
-                    'phone', 'operator', 'region', 'personalities', 'emails',
-                    'snils', 'inn', 'addresses', 'cards', 'telegram_links'
-                ]}),
                 data.get("timestamp")
             )
         )
         conn.commit()
         conn.close()
+        logger.info(f"Saved report: {data.get('report_id')}")
 
-# ========== ТЕЛЕГРАМ БОТ ==========
+# ========== БОТ ==========
 
 class EnigmaBot:
     def __init__(self, token: str):
@@ -278,59 +315,63 @@ class EnigmaBot:
     
     async def start_command(self, update, context):
         used = RateLimiter().get_today_requests()
-        remaining = MAX_REQUESTS_PER_DAY - used
         await update.message.reply_text(
-            f"🔍 **ENIGMA SEARCH BOT v2.0**\n"
+            f"🔍 **ENIGMA SEARCH BOT v3.0**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Лимит: {MAX_REQUESTS_PER_DAY} запросов/день\n"
-            f"✅ Использовано: {used}\n"
-            f"⏳ Осталось: {remaining}\n\n"
-            f"Команды:\n"
-            f"🔎 /search <номер> - поиск по номеру\n"
-            f"📄 /report <id> - получить отчёт по ID\n"
-            f"📊 /stats - статистика\n\n"
+            f"📊 Лимит: {MAX_REQUESTS_PER_DAY}/день\n"
+            f"✅ Сегодня: {used}\n"
+            f"⏳ Осталось: {MAX_REQUESTS_PER_DAY - used}\n\n"
+            f"📌 Команды:\n"
+            f"/search <номер> - поиск и парсинг\n"
+            f"/report <id> - парсинг по ID\n"
+            f"/stats - статистика\n\n"
             f"Пример:\n"
-            f"/search 79114649118\n"
-            f"/report 019f3a2a-2744-70b0-9a93-f63c67f50388"
+            f"/search 79114649118"
         )
     
     async def search_command(self, update, context):
         if not context.args:
-            await update.message.reply_text("❌ Введите номер: /search 79114649118")
+            await update.message.reply_text("❌ Введи номер: /search 79114649118")
             return
         
         phone = context.args[0]
-        can, used, remaining = RateLimiter().can_make_request()
-        if not can:
-            await update.message.reply_text(f"❌ Лимит! {used}/{MAX_REQUESTS_PER_DAY}")
+        clean_phone = re.sub(r'\D', '', phone)
+        
+        if len(clean_phone) < 10:
+            await update.message.reply_text(f"❌ Номер слишком короткий: {clean_phone}\nВведи полный номер, например: 79114649118")
             return
         
-        await update.message.reply_text(f"🔍 Поиск по номеру {phone}...\nОсталось: {remaining}")
+        await update.message.reply_text(f"🔍 Ищу информацию по номеру {clean_phone}...")
         
-        # Показываем ссылки для поиска
-        clean_phone = re.sub(r'\D', '', phone)
-        response = f"🔍 **Поиск по номеру:** {clean_phone}\n\n"
-        response += "📌 **Ссылки для поиска:**\n"
-        response += f"• https://google.com/search?q={clean_phone}+enigmasearch\n"
-        response += f"• https://enigmasearch.org/search?q={clean_phone}\n"
-        response += f"• https://www.google.com/search?q=%22{clean_phone}%22+site:enigmasearch.org\n"
-        response += "\n⚠️ EnigmaSearch не имеет открытого API для поиска.\n"
-        response += "Найди отчёт вручную и используй /report <id>"
+        await self.parser.init_session()
+        result = await self.parser.search_by_phone(clean_phone)
+        await self.parser.close_session()
         
+        if "error" in result:
+            # Показываем ссылки для ручного поиска
+            response = f"❌ **{result['error']}**\n\n"
+            if result.get("search_links"):
+                response += "📌 **Ссылки для поиска:**\n"
+                for link in result["search_links"]:
+                    response += f"• {link}\n"
+            await update.message.reply_text(response)
+            return
+        
+        # Форматируем результат
+        response = self.format_report(result)
         await update.message.reply_text(response)
+        
+        # Сохраняем JSON
+        with open(f"report_{result['report_id'][:8]}.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
     
     async def report_command(self, update, context):
         if not context.args:
-            await update.message.reply_text("❌ Введите ID: /report 019f3a2a-2744-70b0-9a93-f63c67f50388")
+            await update.message.reply_text("❌ Введи ID: /report 019f3a2a-2744-70b0-9a93-f63c67f50388")
             return
         
         report_id = context.args[0]
-        can, used, remaining = RateLimiter().can_make_request()
-        if not can:
-            await update.message.reply_text(f"❌ Лимит! {used}/{MAX_REQUESTS_PER_DAY}")
-            return
-        
-        await update.message.reply_text(f"📄 Парсинг отчёта {report_id}...\nОсталось: {remaining}")
+        await update.message.reply_text(f"📄 Парсинг отчёта {report_id}...")
         
         await self.parser.init_session()
         result = await self.parser.fetch_report(report_id)
@@ -340,13 +381,19 @@ class EnigmaBot:
             await update.message.reply_text(f"❌ {result['error']}")
             return
         
-        # Форматируем ответ
+        response = self.format_report(result)
+        await update.message.reply_text(response)
+    
+    def format_report(self, result: Dict) -> str:
+        """Форматирование отчёта"""
+        d = result.get("data", {})
+        
         response = "📋 **ОТЧЁТ ENIGMA SEARCH**\n"
         response += "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        d = result.get("data", {})
         
         if d.get("phone"):
             response += f"📱 **Телефон:** `{d['phone']}`\n"
+        
         if d.get("operator") or d.get("region"):
             response += f"📍 {d.get('operator', '')} | {d.get('region', '')}\n"
         
@@ -385,21 +432,25 @@ class EnigmaBot:
             for tg in d["telegram_links"][:3]:
                 response += f"  • {tg}\n"
         
+        # Статистика
+        if result.get("statistics"):
+            stats = result["statistics"]
+            response += "\n📊 **Найдено:**\n"
+            response += f"  • Личностей: {stats.get('personalities', 0)}\n"
+            response += f"  • Email: {stats.get('emails', 0)}\n"
+            response += f"  • Адресов: {stats.get('addresses', 0)}\n"
+        
         response += "\n━━━━━━━━━━━━━━━━━━━━━━━\n"
         response += f"🔗 [Открыть в браузере]({result.get('url', '')})"
         
-        await update.message.reply_text(response)
-        
-        # Сохраняем JSON
-        with open(f"report_{report_id[:8]}.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+        return response
     
     async def stats_command(self, update, context):
         used = RateLimiter().get_today_requests()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM parsed_data")
-        total_parsed = c.fetchone()[0]
+        total = c.fetchone()[0]
         conn.close()
         
         await update.message.reply_text(
@@ -407,7 +458,7 @@ class EnigmaBot:
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📅 Сегодня: {used}/{MAX_REQUESTS_PER_DAY}\n"
             f"⏳ Осталось: {MAX_REQUESTS_PER_DAY - used}\n"
-            f"📦 Всего отчётов: {total_parsed}"
+            f"📦 В БД: {total} отчётов"
         )
     
     def run(self):
@@ -426,7 +477,5 @@ class EnigmaBot:
 
 if __name__ == "__main__":
     init_db()
-    
-    # ТВОЙ ТОКЕН УЖЕ ВСТАВЛЕН
     bot = EnigmaBot(BOT_TOKEN)
     bot.run()
