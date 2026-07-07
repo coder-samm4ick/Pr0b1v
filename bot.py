@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OSINT Telegram Bot с админ-панелью для пробива по открытым источникам.
-Полный, готовый к использованию код без цензуры и ограничений.
-
-Требования:
-pip install pyTelegramBotAPI requests beautifulsoup4 lxml fake-useragent phonenumbers
-pip install python-whois dnspython openpyxl pandas sqlite3
-
-Структура БД:
-- users (user_id, username, first_name, last_name, join_date, requests_count, blocked, access_level)
-- requests_log (id, user_id, query_type, query_text, timestamp, ip_address)
-- api_keys (service_name, api_key, is_active)
-- search_templates (id, name, template_text)
+OSINT Telegram Bot с реальным парсингом данных.
+Парсит публичные источники и возвращает найденную информацию.
 """
 
 import telebot
@@ -29,41 +19,26 @@ import threading
 from datetime import datetime, timedelta
 from fake_useragent import UserAgent
 import phonenumbers
-from phonenumbers import geocoder, carrier
+from phonenumbers import geocoder, carrier, timezone
 import whois
 import dns.resolver
 import socket
 import ssl
-import OpenSSL
-from urllib.parse import urlparse, quote_plus
 import logging
+from urllib.parse import urlparse, quote_plus, unquote
+import random
 
 # ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = "8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0"  # Токен бота от @BotFather
-ADMIN_IDS = [8563327706]  # ID администраторов
+BOT_TOKEN = "8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0"
+ADMIN_IDS = [8563327706]
 DB_NAME = "osint_bot.db"
 TEMP_DIR = "temp_files"
 LOG_FILE = "bot_operations.log"
 
-# API ключи для сервисов (оставьте пустыми, бот работает и без них)
-API_KEYS = {
-    "numverify": "",        # https://numverify.com
-    "hunter": "",           # https://hunter.io
-    "shodan": "",           # https://shodan.io
-    "haveibeenpwned": "",   # https://haveibeenpwned.com/API
-    "leakosint": "",        # Кастомный
-    "searchcode": "",       # https://searchcode.com/api
-    "ghostproject": "",     # Специализированный
-}
-
-# ============ ИНИЦИАЛИЗАЦИЯ ============
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -75,11 +50,9 @@ if not os.path.exists(TEMP_DIR):
 
 # ============ БАЗА ДАННЫХ ============
 def init_database():
-    """Инициализация базы данных со всеми таблицами"""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     cursor = conn.cursor()
     
-    # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -95,7 +68,6 @@ def init_database():
         )
     ''')
     
-    # Таблица логов запросов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS requests_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,179 +75,100 @@ def init_database():
             query_type TEXT,
             query_text TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ip_address TEXT,
             result_summary TEXT,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     ''')
     
-    # Таблица API ключей
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS api_keys (
-            service_name TEXT PRIMARY KEY,
-            api_key TEXT,
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
-    
-    # Таблица шаблонов поиска
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS search_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            template_text TEXT,
-            created_by INTEGER,
-            FOREIGN KEY (created_by) REFERENCES users(user_id)
-        )
-    ''')
-    
-    # Таблица заблокированных IP
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS blocked_ips (
-            ip_address TEXT PRIMARY KEY,
-            reason TEXT,
-            blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица прокси
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS proxies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            proxy_address TEXT,
-            proxy_type TEXT,
-            is_active BOOLEAN DEFAULT 1,
-            last_checked TIMESTAMP
+        CREATE TABLE IF NOT EXISTS search_cache (
+            query_hash TEXT PRIMARY KEY,
+            query_type TEXT,
+            query_text TEXT,
+            result_data TEXT,
+            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized successfully")
 
-# ============ КЛАСС ПОИСКОВИКА ============
+# ============ ОСНОВНОЙ КЛАСС ПОИСКА ============
 class OSINTSearcher:
-    """Основной класс для поиска информации"""
-    
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate',
-        })
-        self.results_cache = {}
+        self.cache = {}
     
-    def get_random_headers(self):
-        """Генерация случайных заголовков"""
+    def _get_headers(self):
         return {
             'User-Agent': ua.random,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': random.choice(['ru-RU,ru;q=0.9', 'en-US,en;q=0.8', 'uk-UA,uk;q=0.9']),
-            'X-Forwarded-For': f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}",
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
         }
+    
+    def _safe_request(self, url, timeout=10, retries=2):
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(url, headers=self._get_headers(), timeout=timeout)
+                return resp
+            except Exception as e:
+                if attempt == retries - 1:
+                    return None
+                time.sleep(1)
+        return None
     
     def search_phone(self, phone):
-        """Поиск по номеру телефона"""
+        """Реальный поиск по номеру телефона"""
         results = {}
+        
+        clean_phone = re.sub(r'[^\d]', '', phone)
+        if len(clean_phone) == 11 and clean_phone.startswith('8'):
+            clean_phone = '7' + clean_phone[1:]
+        if len(clean_phone) == 10 and clean_phone.startswith('9'):
+            clean_phone = '7' + clean_phone
+        
         try:
-            # Очистка номера
-            clean_phone = re.sub(r'[^\d+]', '', phone)
-            if not clean_phone.startswith('+'):
-                if clean_phone.startswith('8'):
-                    clean_phone = '+7' + clean_phone[1:]
-                elif clean_phone.startswith('7'):
-                    clean_phone = '+' + clean_phone
-            
-            # Парсинг через phonenumbers
-            parsed = phonenumbers.parse(clean_phone)
-            results['valid'] = phonenumbers.is_valid_number(parsed)
-            results['country'] = geocoder.description_for_number(parsed, 'ru')
-            results['carrier'] = carrier.name_for_number(parsed, 'ru')
-            results['number_type'] = str(phonenumbers.number_type(parsed))
-            
-            # Поиск в публичных телефонных книгах
-            results['public_records'] = self.search_phone_directories(clean_phone)
-            
-            # Поиск в соцсетях
-            results['social_media'] = self.search_social_by_phone(clean_phone)
-            
-            # Поиск в мессенджерах
-            results['messengers'] = self.check_messengers(clean_phone)
-            
-            # Нумверифаер API
-            if API_KEYS['numverify']:
-                results['numverify'] = self.query_numverify(clean_phone)
-            
-        except Exception as e:
-            results['error'] = str(e)
+            parsed = phonenumbers.parse('+' + clean_phone, 'RU')
+            results['Страна'] = geocoder.description_for_number(parsed, 'ru')
+            results['Регион'] = geocoder.description_for_number(parsed, 'ru')
+            results['Оператор'] = carrier.name_for_number(parsed, 'ru')
+            results['Часовой пояс'] = ', '.join(timezone.time_zones_for_number(parsed))
+            results['Тип номера'] = 'Мобильный' if phonenumbers.number_type(parsed) == 1 else 'Стационарный'
+            results['Валидный'] = 'Да' if phonenumbers.is_valid_number(parsed) else 'Нет'
+        except:
+            results['Ошибка'] = 'Не удалось определить'
         
-        return results
-    
-    def search_phone_directories(self, phone):
-        """Поиск в публичных телефонных справочниках"""
-        results = {}
-        clean_phone = re.sub(r'[^\d]', '', phone)[-10:]
+        # Поиск в телефонных справочниках
+        code = clean_phone[1:4] if len(clean_phone) > 3 else ''
+        number = clean_phone[4:] if len(clean_phone) > 4 else clean_phone
         
-        # Парсинг общедоступных справочников
-        sources = [
-            f"https://www.google.com/search?q={quote_plus(phone)}",
-            f"https://yandex.ru/search/?text={quote_plus(phone)}",
-            f"https://spravkaru.net/phone/{clean_phone}",
-            f"https://phonenum.info/phone/{clean_phone}",
-            f"https://who-calling.ru/phone/{clean_phone}",
-            f"https://zvonili.com/nomer/{clean_phone}",
-            f"https://numbuster.com/ru/search?q={clean_phone}",
-        ]
+        # Парсинг who-calling.ru
+        try:
+            resp = self._safe_request(f'https://who-calling.ru/nomer/{clean_phone}')
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                comments = soup.find_all('div', class_='comment-text')
+                if comments:
+                    results['Отзывы (who-calling)'] = [c.text.strip()[:200] for c in comments[:5]]
+                category = soup.find('span', class_='label-category')
+                if category:
+                    results['Категория номера'] = category.text.strip()
+        except:
+            pass
         
-        for source in sources:
-            try:
-                headers = self.get_random_headers()
-                resp = self.session.get(source, timeout=10, headers=headers)
-                if resp.status_code == 200:
-                    results[source] = "Доступен для анализа"
-            except:
-                results[source] = "Недоступен"
+        # Поиск в Google (первые результаты)
+        try:
+            resp = self._safe_request(f'https://www.google.com/search?q={quote_plus("+" + clean_phone)}&hl=ru')
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                snippets = soup.find_all('div', class_='VwiC3b')
+                if snippets:
+                    results['Упоминания в Google'] = [s.text[:150] for s in snippets[:5]]
+        except:
+            pass
         
-        return results
-    
-    def search_social_by_phone(self, phone):
-        """Поиск в соцсетях по номеру телефона"""
-        results = {}
-        clean_phone = re.sub(r'[^\d]', '', phone)
-        
-        # Facebook
-        results['facebook'] = f"https://www.facebook.com/search/people/?q={clean_phone}"
-        # VK
-        results['vk'] = f"https://vk.com/search?c[phone]={clean_phone}"
-        # Одноклассники
-        results['ok'] = f"https://ok.ru/dk?st.cmd=searchResult&st.query={clean_phone}"
-        # Instagram
-        results['instagram'] = f"https://www.instagram.com/web/search/topsearch/?query={clean_phone}"
-        
-        return results
-    
-    def check_messengers(self, phone):
-        """Проверка наличия аккаунтов в мессенджерах"""
-        results = {}
-        clean_phone = re.sub(r'[^\d]', '', phone)
-        
-        messengers = {
-            'Telegram': f"https://t.me/{clean_phone}",
-            'WhatsApp': f"https://wa.me/{clean_phone}",
-            'Viber': f"https://viber.click/{clean_phone}",
-            'Signal': f"https://signal.me/#p/{clean_phone}",
-        }
-        
-        for name, url in messengers.items():
-            try:
-                resp = self.session.head(url, timeout=5)
-                results[name] = "Возможно активен" if resp.status_code == 200 else "Не найден"
-            except:
-                results[name] = "Ошибка проверки"
+        results['Telegram'] = f'https://t.me/+{clean_phone}'
+        results['WhatsApp'] = f'https://wa.me/{clean_phone}'
         
         return results
     
@@ -283,79 +176,116 @@ class OSINTSearcher:
         """Поиск по email"""
         results = {}
         
-        # Валидация email
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-            return {'error': 'Некорректный формат email'}
+            return {'Ошибка': 'Некорректный email'}
         
-        results['domain_info'] = self.get_domain_info(email.split('@')[1])
-        results['social_accounts'] = self.search_social_by_email(email)
-        results['data_breaches'] = self.check_email_breaches(email)
+        domain = email.split('@')[1]
+        username = email.split('@')[0]
         
-        # Hunter API
-        if API_KEYS['hunter']:
-            results['hunter'] = self.query_hunter(email)
+        # WHOIS домена
+        try:
+            w = whois.whois(domain)
+            results['Домен зарегистрирован'] = str(w.creation_date)
+            results['Регистратор'] = w.registrar or 'Не указан'
+            results['Страна'] = w.country or 'Не указана'
+        except:
+            results['WHOIS'] = 'Не удалось получить'
+        
+        # Проверка утечек через публичное API
+        try:
+            resp = self._safe_request(f'https://haveibeenpwned.com/api/v3/breachedaccount/{email}?truncateResponse=true')
+            if resp and resp.status_code == 200:
+                breaches = resp.json()
+                results['Найден в утечках'] = [b['Name'] for b in breaches[:10]]
+            elif resp and resp.status_code == 404:
+                results['Утечки'] = 'Не найден в известных утечках'
+        except:
+            results['Утечки'] = 'Не удалось проверить'
         
         # Gravatar
         hash_md5 = hashlib.md5(email.lower().encode()).hexdigest()
-        results['gravatar'] = f"https://www.gravatar.com/{hash_md5}"
+        results['Gravatar'] = f'https://www.gravatar.com/{hash_md5}'
         
-        # Поиск в Google
-        results['google_search'] = f"https://www.google.com/search?q=%22{quote_plus(email)}%22"
+        # Поиск в соцсетях
+        results['Facebook'] = f'https://www.facebook.com/search/people/?q={quote_plus(email)}'
+        results['LinkedIn'] = f'https://www.linkedin.com/search/results/people/?keywords={quote_plus(email)}'
+        results['VK'] = f'https://vk.com/search?c[email]={email}'
         
-        return results
-    
-    def search_social_by_email(self, email):
-        """Поиск соцсетей по email"""
-        results = {}
-        email_encoded = quote_plus(email)
-        
-        platforms = {
-            'Facebook': f"https://www.facebook.com/search/people/?q={email_encoded}",
-            'LinkedIn': f"https://www.linkedin.com/pub/dir/?search={email_encoded}",
-            'Twitter': f"https://twitter.com/search?q={email_encoded}",
-            'GitHub': f"https://github.com/search?q={email_encoded}&type=users",
-            'VK': f"https://vk.com/search?c[email]={email}",
-            'Reddit': f"https://www.reddit.com/search/?q={email_encoded}",
-        }
-        
-        for platform, url in platforms.items():
-            results[platform] = url
+        # Проверка домена email
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            results['MX записи'] = [str(mx) for mx in mx_records]
+        except:
+            results['MX записи'] = 'Не найдены'
         
         return results
     
-    def check_email_breaches(self, email):
-        """Проверка утечек через HaveIBeenPwned"""
-        if API_KEYS['haveibeenpwned']:
-            try:
-                headers = {'hibp-api-key': API_KEYS['haveibeenpwned']}
-                resp = requests.get(
-                    f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}",
-                    headers=headers,
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                return "Нет данных об утечках"
-            except:
-                return "Ошибка API"
-        return "API ключ не настроен"
-    
-    def search_vehicle_vin(self, vin):
+    def search_vin(self, vin):
         """Поиск по VIN номеру"""
         results = {}
+        clean_vin = vin.upper().strip()
         
-        if not re.match(r'^[A-HJ-NPR-Z0-9]{17}$', vin.upper()):
-            return {'error': 'Некорректный VIN'}
+        if not re.match(r'^[A-HJ-NPR-Z0-9]{17}$', clean_vin):
+            return {'Ошибка': 'Некорректный VIN'}
         
         # Расшифровка VIN
-        results['wmi'] = vin[:3]  # Производитель
-        results['vds'] = vin[3:9]  # Характеристики
-        results['vis'] = vin[9:]   # Идентификатор
+        wmi = clean_vin[:3]
+        vds = clean_vin[3:9]
+        vis = clean_vin[9:17]
         
-        # Поиск в базах
-        results['gibdd_check'] = f"https://xn--90adear.xn--p1ai/check/auto?vin={vin}"
-        results['rsa_check'] = f"https://dkbm-web.autoins.ru/dkbm-web-1.0/bsostate.htm?vin={vin}"
-        results['autoteka'] = f"https://autoteka.ru/vin/{vin}"
+        # WMI справочник
+        wmi_dict = {
+            'XTA': 'LADA (АвтоВАЗ)',
+            'XTB': 'АЗЛК/Москвич',
+            'XTC': 'КамАЗ',
+            'XTD': 'ЗАЗ',
+            'XTE': 'ГАЗ',
+            'XTH': 'АЗЛК',
+            'XTT': 'УАЗ',
+            'XTY': 'ИжМаш',
+            'ZAA': 'Alfa Romeo',
+            'ZFF': 'Ferrari',
+            'ZFA': 'Fiat',
+            'VF1': 'Renault',
+            'VF3': 'Peugeot',
+            'VF7': 'Citroen',
+            'WBA': 'BMW',
+            'WBS': 'BMW M',
+            'WDB': 'Mercedes-Benz',
+            'WDD': 'Mercedes-Benz',
+            'WAU': 'Audi',
+            'WVW': 'Volkswagen',
+            'WVG': 'Volkswagen',
+            '1HG': 'Honda USA',
+            'JHM': 'Honda Japan',
+            '1FT': 'Ford Truck',
+            '2FM': 'Ford Canada',
+            'JM1': 'Mazda',
+            'JN1': 'Nissan',
+            'JT2': 'Toyota',
+            'JS1': 'Suzuki',
+            'KMH': 'Hyundai',
+            'KNA': 'Kia',
+        }
+        
+        results['Производитель (WMI)'] = wmi_dict.get(wmi, f'Неизвестный код: {wmi}')
+        results['Модельный год'] = vis[0] if len(vis) > 0 else 'Не определен'
+        results['Завод-изготовитель'] = vis[1] if len(vis) > 1 else 'Не определен'
+        results['Серийный номер'] = vis[2:] if len(vis) > 2 else 'Не определен'
+        
+        # Год выпуска по VIN (10-й символ)
+        year_codes = {
+            'A': 2010, 'B': 2011, 'C': 2012, 'D': 2013, 'E': 2014,
+            'F': 2015, 'G': 2016, 'H': 2017, 'J': 2018, 'K': 2019,
+            'L': 2020, 'M': 2021, 'N': 2022, 'P': 2023, 'R': 2024,
+            'S': 2025, 'T': 2026, 'V': 2027, 'W': 2028, 'X': 2029
+        }
+        model_year_code = clean_vin[9] if len(clean_vin) > 9 else None
+        if model_year_code and model_year_code in year_codes:
+            results['Год выпуска'] = year_codes[model_year_code]
+        
+        results['Проверка ГИБДД'] = f'https://xn--90adear.xn--p1ai/check/auto?vin={clean_vin}'
+        results['Автотека'] = f'https://autoteka.ru/vin/{clean_vin}'
         
         return results
     
@@ -364,184 +294,210 @@ class OSINTSearcher:
         results = {}
         clean_plate = re.sub(r'[^\w]', '', plate.upper())
         
-        results['gibdd_check'] = f"https://xn--90adear.xn--p1ai/check/auto?regnum={clean_plate}"
-        results['fines'] = f"https://shtrafy-gibdd.ru/check?regnum={clean_plate}"
-        results['taxi_check'] = f"https://taxi.yandex.ru/check/{clean_plate}"
+        # Определение региона
+        region_match = re.search(r'(\d{2,3})$', clean_plate)
+        if region_match:
+            region_code = int(region_match.group(1))
+            regions = {
+                77: 'Москва', 78: 'Санкт-Петербург', 50: 'Московская область',
+                47: 'Ленинградская область', 23: 'Краснодарский край',
+                16: 'Республика Татарстан', 66: 'Свердловская область',
+                54: 'Новосибирская область', 61: 'Ростовская область',
+                59: 'Пермский край', 74: 'Челябинская область',
+                52: 'Нижегородская область', 63: 'Самарская область',
+                55: 'Омская область', 34: 'Волгоградская область',
+                02: 'Башкортостан', 116: 'Татарстан (новый)',
+                799: 'Москва (новый)', 797: 'Москва (новый)',
+            }
+            results['Регион регистрации'] = regions.get(region_code, f'Код: {region_code}')
+        
+        results['Проверка ГИБДД'] = f'https://xn--90adear.xn--p1ai/check/auto?regnum={clean_plate}'
+        results['Штрафы ГИБДД'] = f'https://гибдд.рф/check/fines?regnum={clean_plate}'
+        results['Автокод'] = f'https://avtokod.mos.ru/Login?returnUrl=%2f'
         
         return results
     
     def search_social_media(self, username):
         """Поиск профилей в соцсетях"""
+        username = username.replace('@', '').strip()
         results = {}
+        
         sites = {
-            'Instagram': f'https://www.instagram.com/{username}/',
-            'Twitter': f'https://twitter.com/{username}',
-            'Facebook': f'https://www.facebook.com/{username}',
-            'YouTube': f'https://www.youtube.com/@{username}',
-            'Reddit': f'https://www.reddit.com/user/{username}',
-            'Pinterest': f'https://www.pinterest.com/{username}/',
-            'TikTok': f'https://www.tiktok.com/@{username}',
-            'LinkedIn': f'https://www.linkedin.com/in/{username}/',
-            'GitHub': f'https://github.com/{username}',
-            'Steam': f'https://steamcommunity.com/id/{username}',
-            'Twitch': f'https://www.twitch.tv/{username}',
-            'Spotify': f'https://open.spotify.com/user/{username}',
-            'SoundCloud': f'https://soundcloud.com/{username}',
-            'Medium': f'https://medium.com/@{username}',
-            'Flickr': f'https://www.flickr.com/people/{username}/',
-            'Vimeo': f'https://vimeo.com/{username}',
-            'Blogger': f'https://{username}.blogspot.com',
-            'WordPress': f'https://{username}.wordpress.com',
-            'Telegram': f'https://t.me/{username}',
-            'VK': f'https://vk.com/{username}',
-            'OK': f'https://ok.ru/{username}',
+            'Instagram': {
+                'url': f'https://www.instagram.com/{username}/',
+                'check': True
+            },
+            'Twitter/X': {
+                'url': f'https://twitter.com/{username}',
+                'check': True
+            },
+            'GitHub': {
+                'url': f'https://github.com/{username}',
+                'check': True
+            },
+            'Reddit': {
+                'url': f'https://www.reddit.com/user/{username}',
+                'check': True
+            },
+            'TikTok': {
+                'url': f'https://www.tiktok.com/@{username}',
+                'check': True
+            },
+            'VK': {
+                'url': f'https://vk.com/{username}',
+                'check': True
+            },
+            'Telegram': {
+                'url': f'https://t.me/{username}',
+                'check': True
+            },
+            'YouTube': {
+                'url': f'https://www.youtube.com/@{username}',
+                'check': True
+            },
+            'Twitch': {
+                'url': f'https://www.twitch.tv/{username}',
+                'check': True
+            },
+            'Pinterest': {
+                'url': f'https://www.pinterest.com/{username}/',
+                'check': True
+            },
+            'Steam': {
+                'url': f'https://steamcommunity.com/id/{username}',
+                'check': True
+            },
+            'Spotify': {
+                'url': f'https://open.spotify.com/user/{username}',
+                'check': False
+            },
         }
         
-        for platform, url in sites.items():
-            try:
-                headers = self.get_random_headers()
-                resp = self.session.head(url, timeout=5, headers=headers)
-                if resp.status_code == 200:
-                    results[platform] = f"Найден: {url}"
-                elif resp.status_code == 404:
-                    results[platform] = "Не найден"
-                else:
-                    results[platform] = f"Статус: {resp.status_code}"
-            except:
-                results[platform] = "Ошибка проверки"
+        for platform, data in sites.items():
+            if data['check']:
+                try:
+                    resp = self._safe_request(data['url'], timeout=5)
+                    if resp:
+                        if resp.status_code == 200:
+                            results[platform] = f'✅ Найден: {data["url"]}'
+                        elif resp.status_code == 404:
+                            results[platform] = '❌ Не найден'
+                        else:
+                            results[platform] = f'⚠️ Статус: {resp.status_code}'
+                except:
+                    results[platform] = '⚠️ Ошибка проверки'
+            else:
+                results[platform] = f'🔗 {data["url"]}'
         
         return results
     
     def search_domain(self, domain):
         """Поиск информации о домене"""
         results = {}
+        domain = domain.strip().lower()
         
+        # WHOIS
         try:
-            # WHOIS
-            whois_info = whois.whois(domain)
-            results['whois'] = {
-                'registrar': whois_info.registrar,
-                'creation_date': str(whois_info.creation_date),
-                'expiration_date': str(whois_info.expiration_date),
-                'name_servers': whois_info.name_servers,
-                'country': whois_info.country,
-                'org': whois_info.org,
-            }
-            
-            # DNS записи
-            results['dns'] = self.get_dns_records(domain)
-            
-            # SSL сертификат
-            results['ssl'] = self.get_ssl_info(domain)
-            
-            # Технологии сайта
-            results['technologies'] = self.detect_technologies(domain)
-            
-            # Поиск email на домене
-            results['emails'] = self.find_emails_on_domain(domain)
-            
-            # Shodan
-            if API_KEYS['shodan']:
-                ip = socket.gethostbyname(domain)
-                results['shodan'] = self.query_shodan(ip)
-            
+            w = whois.whois(domain)
+            results['Регистратор'] = w.registrar or 'Не указан'
+            results['Дата создания'] = str(w.creation_date) if w.creation_date else 'Не указана'
+            results['Дата окончания'] = str(w.expiration_date) if w.expiration_date else 'Не указана'
+            results['Владелец'] = w.org or 'Скрыт'
+            results['Страна'] = w.country or 'Не указана'
+            results['NS серверы'] = ', '.join(w.name_servers) if w.name_servers else 'Не указаны'
         except Exception as e:
-            results['error'] = str(e)
+            results['WHOIS'] = f'Ошибка: {str(e)[:100]}'
         
-        return results
-    
-    def get_dns_records(self, domain):
-        """Получение DNS записей"""
-        records = {}
-        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA', 'CNAME']
-        
+        # DNS записи
+        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA']
         for rtype in record_types:
             try:
                 answers = dns.resolver.resolve(domain, rtype)
-                records[rtype] = [str(answer) for answer in answers]
+                records = [str(a) for a in answers]
+                results[f'DNS {rtype}'] = ', '.join(records[:5])
             except:
-                records[rtype] = []
+                pass
         
-        return records
-    
-    def get_ssl_info(self, domain):
-        """Получение информации о SSL сертификате"""
+        # IP адрес
+        try:
+            ip = socket.gethostbyname(domain)
+            results['IP адрес'] = ip
+            
+            # Геолокация IP
+            try:
+                geo_resp = self._safe_request(f'http://ip-api.com/json/{ip}')
+                if geo_resp and geo_resp.status_code == 200:
+                    geo_data = geo_resp.json()
+                    results['Страна IP'] = geo_data.get('country', '?')
+                    results['Город'] = geo_data.get('city', '?')
+                    results['Провайдер'] = geo_data.get('isp', '?')
+            except:
+                pass
+        except:
+            results['IP адрес'] = 'Не удалось определить'
+        
+        # SSL сертификат
         try:
             cert = ssl.get_server_certificate((domain, 443))
+            import OpenSSL
             x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, cert)
-            
-            return {
-                'issuer': x509.get_issuer().CN,
-                'subject': x509.get_subject().CN,
-                'not_before': x509.get_notBefore().decode(),
-                'not_after': x509.get_notAfter().decode(),
-                'serial': x509.get_serial_number(),
-            }
+            results['SSL выдан'] = x509.get_issuer().CN
+            results['SSL для'] = x509.get_subject().CN
+            results['SSL действителен до'] = x509.get_notAfter().decode()[:8]
         except:
-            return None
-    
-    def detect_technologies(self, domain):
-        """Определение технологий сайта"""
-        technologies = []
-        url = f"https://{domain}"
+            results['SSL'] = 'Не удалось проверить'
         
+        # Заголовки сервера
         try:
-            resp = self.session.get(url, timeout=10, headers=self.get_random_headers())
-            
-            # Проверка CMS по мета-тегам
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            if soup.find('meta', {'name': 'generator'}):
-                technologies.append(f"CMS: {soup.find('meta', {'name': 'generator'}).get('content')}")
-            
-            if 'wp-content' in resp.text:
-                technologies.append("WordPress обнаружен")
-            if 'Joomla' in resp.text:
-                technologies.append("Joomla обнаружен")
-            
-            # Проверка сервера
-            if 'Server' in resp.headers:
-                technologies.append(f"Сервер: {resp.headers['Server']}")
-            
+            resp = self._safe_request(f'https://{domain}', timeout=5)
+            if resp:
+                server = resp.headers.get('Server', '')
+                if server:
+                    results['Сервер'] = server
+                powered = resp.headers.get('X-Powered-By', '')
+                if powered:
+                    results['Технология'] = powered
         except:
-            technologies.append("Не удалось определить технологии")
+            pass
         
-        return technologies
+        return results
     
-    def find_emails_on_domain(self, domain):
-        """Поиск email адресов на сайте"""
-        try:
-            resp = self.session.get(f"https://{domain}", timeout=10)
-            emails = re.findall(r'[a-zA-Z0-9._%+-]+@{domain}', resp.text)
-            return list(set(emails))
-        except:
-            return []
-    
-    def search_ip_address(self, ip):
-        """Поиск информации об IP адресе"""
+    def search_ip(self, ip):
+        """Поиск информации об IP"""
         results = {}
         
+        # Геолокация
         try:
-            # Геолокация
-            geo_resp = self.session.get(f"http://ip-api.com/json/{ip}", timeout=10)
-            if geo_resp.status_code == 200:
-                results['geo'] = geo_resp.json()
-            
-            # RDNS
-            try:
-                results['rdns'] = socket.gethostbyaddr(ip)[0]
-            except:
-                results['rdns'] = None
-            
-            # Shodan
-            if API_KEYS['shodan']:
-                results['shodan'] = self.query_shodan(ip)
-            
-            # AbuseIPDB (публичная информация)
-            results['abuse'] = f"https://www.abuseipdb.com/check/{ip}"
-            
-        except Exception as e:
-            results['error'] = str(e)
+            geo_resp = self._safe_request(f'http://ip-api.com/json/{ip}')
+            if geo_resp and geo_resp.status_code == 200:
+                geo = geo_resp.json()
+                results['Страна'] = geo.get('country', '?')
+                results['Город'] = geo.get('city', '?')
+                results['Регион'] = geo.get('regionName', '?')
+                results['Провайдер'] = geo.get('isp', '?')
+                results['Организация'] = geo.get('org', '?')
+                results['Координаты'] = f"{geo.get('lat', '?')}, {geo.get('lon', '?')}"
+                results['Часовой пояс'] = geo.get('timezone', '?')
+        except:
+            pass
+        
+        # Reverse DNS
+        try:
+            rdns = socket.gethostbyaddr(ip)
+            results['RDNS'] = rdns[0]
+        except:
+            results['RDNS'] = 'Не определен'
+        
+        # Проверка черных списков
+        try:
+            reversed_ip = '.'.join(reversed(ip.split('.')))
+            bl_resp = self._safe_request(f'https://{reversed_ip}.zen.spamhaus.org', timeout=3)
+            if bl_resp:
+                results['Spamhaus'] = '🚫 В черном списке!'
+            else:
+                results['Spamhaus'] = '✅ Чистый'
+        except:
+            pass
         
         return results
     
@@ -549,28 +505,41 @@ class OSINTSearcher:
         """Поиск информации о человеке"""
         results = {}
         
-        name_parts = full_name.split()
-        surname = name_parts[0] if name_parts else ''
-        name = name_parts[1] if len(name_parts) > 1 else ''
-        patronymic = name_parts[2] if len(name_parts) > 2 else ''
+        parts = full_name.split()
+        surname = parts[0] if parts else ''
+        name = parts[1] if len(parts) > 1 else ''
         
-        # Поиск в соцсетях
-        results['social_search'] = {}
-        for platform in ['vk.com', 'ok.ru', 'facebook.com']:
-            query = f"site:{platform} {full_name}"
-            if birth_date:
-                query += f" {birth_date}"
-            results['social_search'][platform] = f"https://www.google.com/search?q={quote_plus(query)}"
+        results['Поисковый запрос'] = full_name
         
-        # Поиск в телефонных книгах
+        # Поиск в Google
+        query = f'"{full_name}"'
+        if birth_date:
+            query += f' "{birth_date}"'
+        
+        try:
+            resp = self._safe_request(f'https://www.google.com/search?q={quote_plus(query)}&hl=ru')
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                snippets = soup.find_all('div', class_='VwiC3b')
+                if snippets:
+                    results['Упоминания в Google'] = [s.text[:200] for s in snippets[:5]]
+        except:
+            pass
+        
+        # Ссылки на соцсети
         if surname and name:
-            results['phonebook'] = self.search_phonebook_by_name(surname, name)
+            results['VK поиск'] = f'https://vk.com/search?c[name]=1&c[q]={quote_plus(full_name)}'
+            results['OK поиск'] = f'https://ok.ru/dk?st.cmd=searchResult&st.query={quote_plus(full_name)}'
+            results['Facebook поиск'] = f'https://www.facebook.com/search/people/?q={quote_plus(full_name)}'
         
-        # Поиск судебных дел
-        results['court_cases'] = f"https://sudact.ru/regular/?q={quote_plus(full_name)}"
+        # Судебные дела
+        results['Судебные дела'] = f'https://sudact.ru/regular/?q={quote_plus(full_name)}'
         
-        # Поиск в реестре ИП и юрлиц
-        results['companies'] = f"https://egrul.nalog.ru/index.html?q={quote_plus(full_name)}"
+        # Исполнительные производства
+        results['ФССП'] = f'https://fssp.gov.ru/iss/ip/search?query={quote_plus(full_name)}'
+        
+        # ЕГРЮЛ/ЕГРИП
+        results['Налоговая'] = f'https://egrul.nalog.ru/index.html?q={quote_plus(surname)}+{quote_plus(name) if name else ""}'
         
         return results
     
@@ -580,436 +549,313 @@ class OSINTSearcher:
         clean_number = re.sub(r'[^\d]', '', doc_number)
         
         if doc_type == 'passport':
-            results['validity'] = f"https://services.fms.gov.ru/info-service.htm?sid=2000&number={clean_number}"
+            results['Тип документа'] = 'Паспорт РФ'
+            results['Серия'] = clean_number[:4] if len(clean_number) >= 4 else clean_number
+            results['Номер'] = clean_number[4:] if len(clean_number) > 4 else ''
+            results['Проверка ФМС'] = f'https://services.fms.gov.ru/info-service.htm?sid=2000&number={clean_number}'
         elif doc_type == 'snils':
-            results['pension'] = f"https://www.pfr.gov.ru/order/request/"
+            results['Тип документа'] = 'СНИЛС'
+            results['Номер'] = f'{clean_number[:3]}-{clean_number[3:6]}-{clean_number[6:9]} {clean_number[9:11]}' if len(clean_number) >= 11 else clean_number
+            results['ПФР'] = 'https://www.pfr.gov.ru/order/request/'
         elif doc_type == 'inn':
-            results['tax'] = f"https://egrul.nalog.ru/index.html?q={clean_number}"
+            results['Тип документа'] = 'ИНН'
+            results['Номер'] = clean_number
+            if len(clean_number) == 12:
+                results['Тип'] = 'ИНН физического лица'
+            elif len(clean_number) == 10:
+                results['Тип'] = 'ИНН юридического лица'
+            results['Проверка ФНС'] = f'https://egrul.nalog.ru/index.html?q={clean_number}'
         elif doc_type == 'driver_license':
-            results['gibdd'] = f"https://гибдд.рф/check/driver#license_number={clean_number}"
+            results['Тип документа'] = 'Водительское удостоверение'
+            results['Номер'] = clean_number
+            results['Проверка ГИБДД'] = f'https://гибдд.рф/check/driver#license_number={clean_number}'
+        
+        return results
+    
+    def search_company(self, inn):
+        """Поиск компании по ИНН"""
+        results = {}
+        clean_inn = re.sub(r'[^\d]', '', inn)
+        
+        results['ИНН'] = clean_inn
+        
+        # Парсинг rusprofile.ru
+        try:
+            resp = self._safe_request(f'https://www.rusprofile.ru/search?query={clean_inn}')
+            if resp and resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                # Название компании
+                title = soup.find('h1', class_='company-name')
+                if title:
+                    results['Название'] = title.text.strip()
+                
+                # Директор
+                director = soup.find('div', class_='company-director')
+                if director:
+                    results['Руководитель'] = director.text.strip().replace('Руководитель', '').strip()
+                
+                # Адрес
+                address = soup.find('div', class_='company-address')
+                if address:
+                    results['Адрес'] = address.text.strip()
+                
+                # Статус
+                status = soup.find('div', class_='company-status')
+                if status:
+                    results['Статус'] = status.text.strip()
+        except:
+            pass
+        
+        # Альтернативные источники
+        results['СБИС'] = f'https://sbis.ru/contragents/{clean_inn}'
+        results['List-Org'] = f'https://www.list-org.com/search?val={clean_inn}'
+        results['ЕГРЮЛ'] = f'https://egrul.nalog.ru/index.html?q={clean_inn}'
         
         return results
     
     def search_cadastral(self, cad_number):
         """Поиск по кадастровому номеру"""
+        results = {}
         clean_number = re.sub(r'[^\d:.]', '', cad_number)
         
-        return {
-            'rosreestr': f"https://pkk.rosreestr.ru/#/search/{clean_number}",
-            'public_map': f"https://egrp365.ru/map/?kad={clean_number}",
-        }
-    
-    def search_legal_entity(self, inn=None, ogrn=None):
-        """Поиск юридического лица"""
-        results = {}
+        parts = clean_number.split(':')
+        if len(parts) >= 2:
+            results['Кадастровый округ'] = parts[0]
+            results['Кадастровый район'] = parts[1] if len(parts) > 1 else '?'
+            results['Кадастровый квартал'] = parts[2] if len(parts) > 2 else '?'
+            results['Номер участка'] = parts[3] if len(parts) > 3 else '?'
         
-        if inn:
-            clean_inn = re.sub(r'[^\d]', '', inn)
-            results['egrul'] = f"https://egrul.nalog.ru/index.html?q={clean_inn}"
-            results['rusprofile'] = f"https://www.rusprofile.ru/search?query={clean_inn}"
-            results['sbis'] = f"https://sbis.ru/contragents/{clean_inn}"
-            results['listorg'] = f"https://www.list-org.com/search?val={clean_inn}"
-        
-        if ogrn:
-            clean_ogrn = re.sub(r'[^\d]', '', ogrn)
-            results['ogrn_search'] = f"https://egrul.nalog.ru/index.html?q={clean_ogrn}"
+        results['Публичная кадастровая карта'] = f'https://pkk.rosreestr.ru/#/search/{clean_number}'
+        results['ЕГРП 365'] = f'https://egrp365.ru/map/?kad={clean_number}'
         
         return results
 
-# ============ АДМИН-ПАНЕЛЬ ============
-class AdminPanel:
-    """Класс админ-панели"""
-    
-    def __init__(self, bot):
-        self.bot = bot
-    
-    def get_admin_menu(self):
-        """Генерация админ-меню"""
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        
-        buttons = [
-            types.InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
-            types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
-            types.InlineKeyboardButton("🚫 Блокировки", callback_data="admin_blocks"),
-            types.InlineKeyboardButton("📋 Логи", callback_data="admin_logs"),
-            types.InlineKeyboardButton("🔑 API ключи", callback_data="admin_apis"),
-            types.InlineKeyboardButton("📝 Шаблоны", callback_data="admin_templates"),
-            types.InlineKeyboardButton("🌐 Прокси", callback_data="admin_proxies"),
-            types.InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings"),
-            types.InlineKeyboardButton("📨 Рассылка", callback_data="admin_broadcast"),
-            types.InlineKeyboardButton("🔄 Перезагрузка", callback_data="admin_reload"),
-        ]
-        
-        markup.add(*buttons)
-        return markup
-    
-    def get_stats(self):
-        """Получение статистики"""
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        
-        stats = {
-            'total_users': cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-            'active_users_24h': cursor.execute(
-                "SELECT COUNT(DISTINCT user_id) FROM requests_log WHERE timestamp > datetime('now', '-1 day')"
-            ).fetchone()[0],
-            'total_requests': cursor.execute("SELECT COUNT(*) FROM requests_log").fetchone()[0],
-            'requests_24h': cursor.execute(
-                "SELECT COUNT(*) FROM requests_log WHERE timestamp > datetime('now', '-1 day')"
-            ).fetchone()[0],
-            'blocked_users': cursor.execute("SELECT COUNT(*) FROM users WHERE blocked = 1").fetchone()[0],
-            'admins': len(ADMIN_IDS),
-        }
-        
-        conn.close()
-        return stats
-    
-    def broadcast_message(self, message_text):
-        """Массовая рассылка пользователям"""
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        users = cursor.execute("SELECT user_id FROM users WHERE blocked = 0").fetchall()
-        conn.close()
-        
-        success = 0
-        failed = 0
-        
-        for (user_id,) in users:
-            try:
-                self.bot.send_message(user_id, message_text, parse_mode='HTML')
-                success += 1
-                time.sleep(0.05)  # Антифлуд
-            except:
-                failed += 1
-        
-        return success, failed
-    
-    def get_user_info(self, user_id):
-        """Получение информации о пользователе"""
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        
-        user = cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        requests = cursor.execute(
-            "SELECT COUNT(*) FROM requests_log WHERE user_id = ?", (user_id,)
-        ).fetchone()[0]
-        
-        conn.close()
-        
-        if user:
-            return {
-                'id': user[0],
-                'username': user[1],
-                'name': f"{user[2]} {user[3] or ''}",
-                'join_date': user[4],
-                'requests': requests,
-                'blocked': user[6],
-                'access_level': user[7],
-                'daily_limit': user[8],
-                'notes': user[9],
-            }
-        return None
-    
-    def block_user(self, user_id, reason=""):
-        """Блокировка пользователя"""
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET blocked = 1, notes = ? WHERE user_id = ?", (reason, user_id))
-        conn.commit()
-        conn.close()
-        return True
-    
-    def unblock_user(self, user_id):
-        """Разблокировка пользователя"""
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-
-# ============ ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ ============
+# ============ ФУНКЦИИ БОТА ============
 searcher = OSINTSearcher()
-admin_panel = AdminPanel(bot)
 
-# ============ ОБРАБОТЧИКИ КОМАНД ============
+def log_request(user_id, query_type, query_text, result_summary=""):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO requests_log (user_id, query_type, query_text, result_summary) VALUES (?, ?, ?, ?)",
+            (user_id, query_type, query_text[:500], result_summary[:500])
+        )
+        cursor.execute(
+            "UPDATE users SET requests_count = requests_count + 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Log error: {e}")
+
+def format_results(results):
+    """Форматирование результатов для Telegram"""
+    text = ""
+    for key, value in results.items():
+        if isinstance(value, list):
+            text += f"\n<b>{key}:</b>\n"
+            for item in value[:5]:
+                text += f"  • {item}\n"
+        elif isinstance(value, str) and value.startswith('http'):
+            text += f"🔗 <a href='{value}'>{key}</a>\n"
+        else:
+            text += f"<b>{key}:</b> {value}\n"
+    return text
+
+def detect_query_type(text):
+    """Определение типа запроса"""
+    text = text.strip()
+    
+    patterns = [
+        ('phone', r'^(\+?[78])?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$'),
+        ('email', r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
+        ('vin', r'^[A-HJ-NPR-Z0-9]{17}$'),
+        ('car_plate', r'^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$'),
+        ('domain', r'^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
+        ('ip', r'^(\d{1,3}\.){3}\d{1,3}$'),
+        ('cadastral', r'^\d{2}:\d{2}:\d{7}:\d+$'),
+        ('username', r'^@[a-zA-Z0-9_\.]+$'),
+    ]
+    
+    for qtype, pattern in patterns:
+        if re.match(pattern, text, re.IGNORECASE):
+            return qtype
+    
+    words = text.split()
+    if len(words) >= 2 and all(w[0].isupper() for w in words if w.isalpha()):
+        has_date = any(re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', w) for w in words)
+        if has_date or len(words) >= 3:
+            return 'person'
+    
+    return 'general'
+
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    """Обработка команды /start"""
     user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
-    
-    # Регистрация пользователя
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, username, first_name, last_name))
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
+        (user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    )
+    
+    blocked = cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
     conn.commit()
     conn.close()
     
-    # Проверка блокировки
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    blocked = cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close()
-    
     if blocked and blocked[0]:
-        bot.reply_to(message, "⛔️ Ваш доступ заблокирован администратором.")
+        bot.reply_to(message, "⛔️ Доступ заблокирован.")
         return
     
-    welcome_text = """
-🕵️ <b>OSINT Search Bot</b>
+    welcome = """
+🕵️ <b>OSINT Search Bot</b> — поиск информации в открытых источниках.
 
-Я помогу найти информацию в открытых источниках:
+<b>Что можно искать:</b>
 
-👤 <b>Поиск по человеку:</b>
-• ФИО + дата рождения: <code>Иванов Иван Иванович 01.01.1990</code>
+👤 <b>Человек:</b> <code>Фамилия Имя Отчество ДД.ММ.ГГГГ</code>
 
-📱 <b>Поиск по контактам:</b>
-• Телефон: <code>79991234567</code>
-• Email: <code>user@example.com</code>
+📱 <b>Телефон:</b> <code>79991234567</code>
+📧 <b>Email:</b> <code>user@example.com</code>
 
-🚗 <b>Поиск по транспорту:</b>
+🚗 <b>Авто:</b>
 • VIN: <code>XTA211440C5106924</code>
-• Госномер: <code>А123ВС199</code>
+• Номер: <code>А123ВС199</code>
 
-🌐 <b>Поиск в интернете:</b>
+🌐 <b>Интернет:</b>
 • Домен: <code>example.com</code>
 • IP: <code>1.1.1.1</code>
-• Соцсети: <code>@username</code>
+• Профиль: <code>@username</code>
 
-📄 <b>Поиск по документам:</b>
+📄 <b>Документы:</b>
 • Паспорт: <code>/passport 1234567890</code>
 • СНИЛС: <code>/snils 12345678901</code>
 • ИНН: <code>/inn 123456789012</code>
+• Права: <code>/vu 1234567890</code>
 
-🏠 <b>Поиск недвижимости:</b>
-• Адрес: <code>/adr Москва, Тверская, 1</code>
-• Кадастровый номер: <code>77:01:0004042:6987</code>
+🏢 <b>Компания:</b> <code>/company 7707083893</code>
+🏠 <b>Кадастр:</b> <code>77:01:0004042:6987</code>
 
-🏢 <b>Юридические лица:</b>
-• ИНН: <code>/inn_company 7707083893</code>
-
-ℹ️ <i>Для администраторов доступна /admin</i>
+/admin — панель администратора
 """
-    bot.reply_to(message, welcome_text)
+    bot.reply_to(message, welcome)
 
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
-    """Админ-панель"""
     if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
         return
     
-    bot.send_message(
-        message.chat.id,
-        "🔐 <b>Админ-панель</b>",
-        reply_markup=admin_panel.get_admin_menu(),
-        parse_mode='HTML'
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+        types.InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
+        types.InlineKeyboardButton("📋 Логи", callback_data="admin_logs"),
+        types.InlineKeyboardButton("🚫 Блокировки", callback_data="admin_blocks"),
     )
+    bot.send_message(message.chat.id, "🔐 <b>Админ-панель</b>", reply_markup=markup)
 
-# ============ КОЛБЭКИ АДМИН-ПАНЕЛИ ============
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
-def admin_callback_handler(call):
-    """Обработка колбэков админ-панели"""
+def admin_callback(call):
     if call.from_user.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "⛔️ Доступ запрещен")
         return
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     
     if call.data == "admin_stats":
-        stats = admin_panel.get_stats()
-        stats_text = f"""
-📊 <b>Статистика бота</b>
-
-👥 Всего пользователей: {stats['total_users']}
-🟢 Активных за 24ч: {stats['active_users_24h']}
-📈 Всего запросов: {stats['total_requests']}
-📊 Запросов за 24ч: {stats['requests_24h']}
-🚫 Заблокировано: {stats['blocked_users']}
-👑 Администраторов: {stats['admins']}
+        total_users = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_requests = cursor.execute("SELECT COUNT(*) FROM requests_log").fetchone()[0]
+        blocked = cursor.execute("SELECT COUNT(*) FROM users WHERE blocked = 1").fetchone()[0]
+        active_24h = cursor.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM requests_log WHERE timestamp > datetime('now', '-1 day')"
+        ).fetchone()[0]
+        
+        stats = f"""
+📊 <b>Статистика:</b>
+👥 Пользователей: {total_users}
+🟢 Активных за 24ч: {active_24h}
+📈 Всего запросов: {total_requests}
+🚫 Заблокировано: {blocked}
 """
-        bot.edit_message_text(
-            stats_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_panel.get_admin_menu(),
-            parse_mode='HTML'
-        )
+        bot.edit_message_text(stats, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
     
     elif call.data == "admin_users":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        users = cursor.execute("SELECT user_id, username, first_name, blocked FROM users ORDER BY join_date DESC LIMIT 20").fetchall()
-        conn.close()
-        
-        if users:
-            users_text = "👥 <b>Последние пользователи:</b>\n\n"
-            for user in users:
-                status = "🚫" if user[3] else "✅"
-                name = user[2] or "Неизвестный"
-                uname = f"@{user[1]}" if user[1] else "нет username"
-                users_text += f"{status} <code>{user[0]}</code> {name} ({uname})\n"
-        else:
-            users_text = "Нет пользователей"
-        
-        bot.edit_message_text(
-            users_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_panel.get_admin_menu(),
-            parse_mode='HTML'
-        )
+        users = cursor.execute("SELECT user_id, username, first_name, requests_count, blocked FROM users ORDER BY requests_count DESC LIMIT 20").fetchall()
+        text = "👥 <b>Топ пользователей:</b>\n\n"
+        for u in users:
+            status = "🚫" if u[4] else "✅"
+            text += f"{status} <code>{u[0]}</code> {u[2] or '?'} (@{u[1] or 'нет'}) — {u[3]} запросов\n"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
     
     elif call.data == "admin_logs":
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
         logs = cursor.execute(
-            "SELECT user_id, query_type, query_text, timestamp FROM requests_log ORDER BY timestamp DESC LIMIT 20"
+            "SELECT user_id, query_type, query_text, timestamp FROM requests_log ORDER BY timestamp DESC LIMIT 15"
         ).fetchall()
-        conn.close()
-        
-        if logs:
-            logs_text = "📋 <b>Последние запросы:</b>\n\n"
-            for log in logs:
-                logs_text += f"🕐 {log[3]} | 👤 <code>{log[0]}</code>\n"
-                logs_text += f"📌 {log[1]}: {log[2][:100]}\n\n"
+        text = "📋 <b>Последние запросы:</b>\n\n"
+        for log in logs:
+            text += f"🕐 {log[3][:16]} | 👤 {log[0]} | {log[1]}: {log[2][:80]}\n"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
+    
+    elif call.data == "admin_blocks":
+        blocked_users = cursor.execute("SELECT user_id, username, notes FROM users WHERE blocked = 1").fetchall()
+        if blocked_users:
+            text = "🚫 <b>Заблокированные:</b>\n\n"
+            for u in blocked_users:
+                text += f"<code>{u[0]}</code> @{u[1] or 'нет'} — {u[2] or 'без причины'}\n"
         else:
-            logs_text = "Нет логов"
-        
-        bot.edit_message_text(
-            logs_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=admin_panel.get_admin_menu(),
-            parse_mode='HTML'
-        )
+            text = "Нет заблокированных пользователей"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
     
-    elif call.data == "admin_broadcast":
-        bot.edit_message_text(
-            "📨 Введите текст для рассылки:",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        bot.register_next_step_handler(call.message, process_broadcast)
-
-def process_broadcast(message):
-    """Обработка текста для рассылки"""
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    
-    success, failed = admin_panel.broadcast_message(message.text)
-    
-    bot.send_message(
-        message.chat.id,
-        f"✅ Рассылка завершена\n\n"
-        f"Успешно: {success}\n"
-        f"Ошибок: {failed}",
-        reply_markup=admin_panel.get_admin_menu(),
-        parse_mode='HTML'
-    )
+    conn.close()
 
 @bot.message_handler(commands=['passport', 'snils', 'inn', 'vu'])
-def document_search_command(message):
-    """Поиск по документам"""
-    command = message.text.split()
-    
-    if len(command) < 2:
+def doc_commands(message):
+    cmd = message.text.split()
+    if len(cmd) < 2:
         bot.reply_to(message, "❌ Укажите номер документа")
         return
     
-    doc_types = {
-        '/passport': 'passport',
-        '/snils': 'snils',
-        '/inn': 'inn',
-        '/vu': 'driver_license'
-    }
+    doc_map = {'/passport': 'passport', '/snils': 'snils', '/inn': 'inn', '/vu': 'driver_license'}
+    doc_type = doc_map.get(cmd[0])
+    doc_num = cmd[1]
     
-    doc_type = doc_types.get(command[0])
-    doc_number = command[1]
+    log_request(message.from_user.id, doc_type, doc_num)
     
-    log_request(message.from_user.id, doc_type, doc_number)
-    
-    results = searcher.search_document(doc_type, doc_number)
-    
-    response = format_search_results(doc_type.upper(), results, message.from_user.id)
-    bot.reply_to(message, response, parse_mode='HTML')
+    bot.send_chat_action(message.chat.id, 'typing')
+    results = searcher.search_document(doc_type, doc_num)
+    response = f"📄 <b>Результаты поиска ({doc_type.upper()}):</b>\n{format_results(results)}"
+    bot.reply_to(message, response, disable_web_page_preview=True)
 
-@bot.message_handler(commands=['adr'])
-def address_search_command(message):
-    """Поиск по адресу"""
-    address = message.text.replace('/adr', '').strip()
-    
-    if not address:
-        bot.reply_to(message, "❌ Укажите адрес")
-        return
-    
-    log_request(message.from_user.id, 'address', address)
-    
-    response = f"🔍 <b>Поиск по адресу:</b> {address}\n\n"
-    response += f"📌 Яндекс.Карты: https://yandex.ru/maps/?text={quote_plus(address)}\n"
-    response += f"📌 Google Maps: https://www.google.com/maps/search/{quote_plus(address)}\n"
-    response += f"📌 2ГИС: https://2gis.ru/search/{quote_plus(address)}\n"
-    response += f"📌 Публичная кадастровая карта: https://pkk.rosreestr.ru/#/search/{quote_plus(address)}\n"
-    
-    bot.reply_to(message, response, parse_mode='HTML')
-
-@bot.message_handler(commands=['inn_company'])
-def company_search_command(message):
-    """Поиск компании по ИНН"""
-    inn = message.text.replace('/inn_company', '').strip()
-    
+@bot.message_handler(commands=['company'])
+def company_command(message):
+    inn = message.text.replace('/company', '').strip()
     if not inn:
-        bot.reply_to(message, "❌ Укажите ИНН организации")
+        bot.reply_to(message, "❌ Укажите ИНН компании")
         return
     
-    log_request(message.from_user.id, 'company_inn', inn)
+    log_request(message.from_user.id, 'company', inn)
     
-    results = searcher.search_legal_entity(inn=inn)
-    
-    response = format_search_results('ИНН КОМПАНИИ', results, message.from_user.id)
-    bot.reply_to(message, response, parse_mode='HTML')
+    bot.send_chat_action(message.chat.id, 'typing')
+    results = searcher.search_company(inn)
+    response = f"🏢 <b>Результаты поиска компании:</b>\n{format_results(results)}"
+    bot.reply_to(message, response, disable_web_page_preview=True)
 
 @bot.message_handler(content_types=['photo'])
-def photo_search_handler(message):
-    """Поиск по фото"""
-    if not message.photo:
-        bot.reply_to(message, "❌ Отправьте фото как файл, а не как сжатое изображение")
-        return
-    
-    file_id = message.photo[-1].file_id
-    file_info = bot.get_file(file_id)
-    file_path = file_info.file_path
-    
-    # Скачивание файла
-    downloaded_file = bot.download_file(file_path)
-    
-    save_path = os.path.join(TEMP_DIR, f"photo_{message.from_user.id}_{int(time.time())}.jpg")
-    with open(save_path, 'wb') as f:
-        f.write(downloaded_file)
-    
-    # Поиск по фото (Google, Yandex, TinEye)
-    response = "🔍 <b>Результаты поиска по фото:</b>\n\n"
-    response += f"📌 Google Images: https://www.google.com/imghp\n"
-    response += f"📌 Яндекс.Картинки: https://yandex.ru/images/search\n"
-    response += f"📌 TinEye: https://tineye.com\n"
-    response += f"📌 PimEyes (поиск лиц): https://pimeyes.com/en\n"
-    response += "\nℹ️ <i>Загрузите фото на эти сайты для поиска</i>"
-    
-    bot.reply_to(message, response, parse_mode='HTML')
-    
-    # Удаление временного файла
-    try:
-        os.remove(save_path)
-    except:
-        pass
+def photo_handler(message):
+    bot.reply_to(message, """
+🔍 <b>Поиск по фото:</b>
 
-@bot.message_handler(func=lambda message: True)
-def universal_search_handler(message):
-    """Универсальный обработчик поиска"""
+Загрузите фото на эти сервисы:
+
+📌 <a href='https://pimeyes.com'>PimEyes</a> — поиск лиц
+📌 <a href='https://tineye.com'>TinEye</a> — обратный поиск изображений
+📌 <a href='https://yandex.ru/images/search'>Яндекс.Картинки</a>
+📌 <a href='https://images.google.com'>Google Images</a>
+""", disable_web_page_preview=True)
+
+@bot.message_handler(func=lambda m: True)
+def universal_handler(message):
     text = message.text.strip()
     user_id = message.from_user.id
     
@@ -1019,11 +865,11 @@ def universal_search_handler(message):
     blocked = cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
     
     if blocked and blocked[0]:
-        bot.reply_to(message, "⛔️ Ваш доступ заблокирован администратором.")
+        bot.reply_to(message, "⛔️ Доступ заблокирован")
         conn.close()
         return
     
-    # Проверка дневного лимита
+    # Проверка лимита
     count = cursor.execute(
         "SELECT COUNT(*) FROM requests_log WHERE user_id = ? AND timestamp > datetime('now', '-1 day')",
         (user_id,)
@@ -1034,312 +880,120 @@ def universal_search_handler(message):
     conn.close()
     
     if count >= daily_limit:
-        bot.reply_to(message, f"⚠️ Достигнут дневной лимит запросов ({daily_limit})")
+        bot.reply_to(message, f"⚠️ Дневной лимит ({daily_limit}) исчерпан")
         return
     
-    # Определение типа запроса
     query_type = detect_query_type(text)
     
-    # Логирование
-    log_request(user_id, query_type, text)
+    bot.send_chat_action(message.chat.id, 'typing')
     
-    # Поиск
-    try:
-        if query_type == 'phone':
-            results = searcher.search_phone(text)
-        elif query_type == 'email':
-            results = searcher.search_email(text)
-        elif query_type == 'vin':
-            results = searcher.search_vehicle_vin(text)
-        elif query_type == 'car_plate':
-            results = searcher.search_car_plate(text)
-        elif query_type == 'domain':
-            results = searcher.search_domain(text)
-        elif query_type == 'ip':
-            results = searcher.search_ip_address(text)
-        elif query_type == 'username':
-            results = searcher.search_social_media(text)
-        elif query_type == 'cadastral':
-            results = searcher.search_cadastral(text)
-        elif query_type == 'person':
-            # Пробуем извлечь ФИО и дату рождения
-            parts = text.split()
-            name_parts = []
-            birth_date = None
-            
-            for part in parts:
-                if re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', part):
-                    birth_date = part
-                else:
-                    name_parts.append(part)
-            
-            full_name = ' '.join(name_parts)
-            results = searcher.search_person(full_name, birth_date)
-        else:
-            # Универсальный поиск в Google
-            results = {
-                'google': f"https://www.google.com/search?q={quote_plus(text)}",
-                'yandex': f"https://yandex.ru/search/?text={quote_plus(text)}",
-            }
-        
-        # Обновление счетчика запросов
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET requests_count = requests_count + 1 WHERE user_id = ?",
-            (user_id,)
-        )
-        conn.commit()
-        conn.close()
-        
-        response = format_search_results(query_type.upper(), results, user_id)
-        bot.reply_to(message, response, parse_mode='HTML', disable_web_page_preview=True)
-        
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        bot.reply_to(message, f"❌ Ошибка при выполнении поиска: {str(e)}")
-
-def detect_query_type(text):
-    """Автоматическое определение типа запроса"""
-    text = text.strip()
-    
-    # Паттерны для определения типа данных
-    patterns = {
-        'phone': r'^(\+?[78])?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$',
-        'email': r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
-        'vin': r'^[A-HJ-NPR-Z0-9]{17}$',
-        'car_plate': r'^[АВЕКМНОРСТУХавекмнорстух]\d{3}[АВЕКМНОРСТУХавекмнорстух]{2}\d{2,3}$',
-        'domain': r'^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$',
-        'ip': r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$',
-        'username': r'^@[a-zA-Z0-9_\.]+$',
-        'cadastral': r'^\d{2}:\d{2}:\d{7}:\d+$',
+    search_map = {
+        'phone': searcher.search_phone,
+        'email': searcher.search_email,
+        'vin': searcher.search_vin,
+        'car_plate': searcher.search_car_plate,
+        'domain': searcher.search_domain,
+        'ip': searcher.search_ip,
+        'username': searcher.search_social_media,
+        'cadastral': searcher.search_cadastral,
     }
     
-    for query_type, pattern in patterns.items():
-        if re.match(pattern, text, re.IGNORECASE):
-            return query_type
-    
-    # Проверка на ФИО (минимум 2 слова, начинающихся с заглавных букв)
-    words = text.split()
-    if len(words) >= 2 and all(w[0].isupper() for w in words if w.isalpha()):
-        # Проверяем, есть ли дата рождения
-        has_date = any(re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', w) for w in words)
-        if has_date or len(words) >= 3:
-            return 'person'
-    
-    return 'general'
-
-def format_search_results(query_type, results, user_id):
-    """Форматирование результатов поиска"""
-    response = f"🔍 <b>Результаты поиска ({query_type}):</b>\n\n"
-    
-    if isinstance(results, dict):
-        for key, value in results.items():
-            if isinstance(value, dict):
-                response += f"<b>{key.upper()}:</b>\n"
-                for k, v in value.items():
-                    response += f"  • {k}: {v}\n"
-                response += "\n"
-            elif isinstance(value, list):
-                response += f"<b>{key.upper()}:</b>\n"
-                for item in value:
-                    response += f"  • {item}\n"
-                response += "\n"
+    if query_type == 'person':
+        parts = text.split()
+        name_parts = []
+        birth_date = None
+        for part in parts:
+            if re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', part):
+                birth_date = part
             else:
-                response += f"<b>{key}:</b> {value}\n"
+                name_parts.append(part)
+        results = searcher.search_person(' '.join(name_parts), birth_date)
+    elif query_type in search_map:
+        results = search_map[query_type](text)
     else:
-        response += str(results)
+        results = {
+            'Google': f'https://www.google.com/search?q={quote_plus(text)}',
+            'Яндекс': f'https://yandex.ru/search/?text={quote_plus(text)}',
+        }
     
-    response += f"\n🕐 <i>Поиск выполнен: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+    log_request(user_id, query_type, text, str(results)[:500])
     
-    return response
+    type_names = {
+        'phone': '📱 ТЕЛЕФОН', 'email': '📧 EMAIL', 'vin': '🚗 VIN',
+        'car_plate': '🚘 ГОСНОМЕР', 'domain': '🌐 ДОМЕН', 'ip': '🔢 IP АДРЕС',
+        'username': '👤 СОЦСЕТИ', 'cadastral': '🏠 КАДАСТР', 'person': '👤 ЧЕЛОВЕК',
+        'general': '🔍 ПОИСК'
+    }
+    
+    response = f"<b>Результаты поиска ({type_names.get(query_type, query_type.upper())}):</b>\n{format_results(results)}"
+    response += f"\n<i>🕐 {datetime.now().strftime('%H:%M:%S')}</i>"
+    
+    bot.reply_to(message, response, disable_web_page_preview=True)
 
-def log_request(user_id, query_type, query_text):
-    """Логирование запроса"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO requests_log (user_id, query_type, query_text) VALUES (?, ?, ?)",
-            (user_id, query_type, query_text[:500])
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to log request: {e}")
-
-# ============ ОБРАБОТЧИК КОМАНДЫ /block ============
+# ============ АДМИН КОМАНДЫ ============
 @bot.message_handler(commands=['block'])
-def block_user_command(message):
-    """Блокировка пользователя"""
+def block_user(message):
     if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
         return
-    
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "❌ Использование: /block [user_id] [причина]")
+        bot.reply_to(message, "❌ /block [user_id]")
         return
-    
     try:
-        target_id = int(parts[1])
-        reason = ' '.join(parts[2:]) if len(parts) > 2 else "Без причины"
-        
-        admin_panel.block_user(target_id, reason)
-        
-        bot.reply_to(message, f"✅ Пользователь {target_id} заблокирован\nПричина: {reason}")
-        
-        # Уведомление заблокированному
-        try:
-            bot.send_message(target_id, f"⛔️ Ваш доступ заблокирован администратором.\nПричина: {reason}")
-        except:
-            pass
-        
-    except ValueError:
-        bot.reply_to(message, "❌ Неверный ID пользователя")
+        uid = int(parts[1])
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (uid,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Пользователь {uid} заблокирован")
+    except:
+        bot.reply_to(message, "❌ Ошибка")
 
 @bot.message_handler(commands=['unblock'])
-def unblock_user_command(message):
-    """Разблокировка пользователя"""
+def unblock_user(message):
     if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
         return
-    
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "❌ Использование: /unblock [user_id]")
+        bot.reply_to(message, "❌ /unblock [user_id]")
         return
-    
     try:
-        target_id = int(parts[1])
-        admin_panel.unblock_user(target_id)
-        
-        bot.reply_to(message, f"✅ Пользователь {target_id} разблокирован")
-        
-        try:
-            bot.send_message(target_id, "✅ Ваш доступ восстановлен администратором.")
-        except:
-            pass
-        
-    except ValueError:
-        bot.reply_to(message, "❌ Неверный ID пользователя")
-
-@bot.message_handler(commands=['limit'])
-def set_limit_command(message):
-    """Установка лимита запросов"""
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "❌ Использование: /limit [user_id] [количество]")
-        return
-    
-    try:
-        target_id = int(parts[1])
-        new_limit = int(parts[2])
-        
+        uid = int(parts[1])
         conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET daily_limit = ? WHERE user_id = ?", (new_limit, target_id))
+        conn.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (uid,))
         conn.commit()
         conn.close()
-        
-        bot.reply_to(message, f"✅ Лимит пользователя {target_id} изменен на {new_limit}")
-    except ValueError:
-        bot.reply_to(message, "❌ Неверные параметры")
-
-@bot.message_handler(commands=['userinfo'])
-def user_info_command(message):
-    """Информация о пользователе"""
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ Использование: /userinfo [user_id]")
-        return
-    
-    try:
-        user_id = int(parts[1])
-        info = admin_panel.get_user_info(user_id)
-        
-        if info:
-            text = f"""
-👤 <b>Информация о пользователе</b>
-
-🆔 ID: <code>{info['id']}</code>
-👤 Имя: {info['name']}
-📛 Username: @{info['username'] or 'отсутствует'}
-📅 Присоединился: {info['join_date']}
-📊 Запросов: {info['requests']}
-🔒 Статус: {'🚫 Заблокирован' if info['blocked'] else '✅ Активен'}
-⭐️ Уровень доступа: {info['access_level']}
-📈 Дневной лимит: {info['daily_limit']}
-📝 Заметки: {info['notes'] or 'нет'}
-"""
-            bot.reply_to(message, text, parse_mode='HTML')
-        else:
-            bot.reply_to(message, "❌ Пользователь не найден")
-    
-    except ValueError:
-        bot.reply_to(message, "❌ Неверный ID пользователя")
-
-@bot.message_handler(commands=['export'])
-def export_logs_command(message):
-    """Экспорт логов"""
-    if message.from_user.id not in ADMIN_IDS:
-        bot.reply_to(message, "⛔️ Доступ запрещен")
-        return
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    logs = cursor.execute(
-        "SELECT rl.user_id, u.username, rl.query_type, rl.query_text, rl.timestamp "
-        "FROM requests_log rl LEFT JOIN users u ON rl.user_id = u.user_id "
-        "ORDER BY rl.timestamp DESC LIMIT 1000"
-    ).fetchall()
-    
-    conn.close()
-    
-    if not logs:
-        bot.reply_to(message, "❌ Нет данных для экспорта")
-        return
-    
-    filename = f"logs_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    filepath = os.path.join(TEMP_DIR, filename)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("User ID,Username,Query Type,Query Text,Timestamp\n")
-        for log in logs:
-            f.write(f"{log[0]},{log[1]},{log[2]},\"{log[3]}\",{log[4]}\n")
-    
-    with open(filepath, 'rb') as f:
-        bot.send_document(message.chat.id, f, caption="📋 Экспорт логов")
-    
-    try:
-        os.remove(filepath)
+        bot.reply_to(message, f"✅ Пользователь {uid} разблокирован")
     except:
-        pass
+        bot.reply_to(message, "❌ Ошибка")
 
-# ============ ЗАПУСК БОТА ============
+@bot.message_handler(commands=['limit'])
+def set_limit(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(message, "❌ /limit [user_id] [число]")
+        return
+    try:
+        uid = int(parts[1])
+        lim = int(parts[2])
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE users SET daily_limit = ? WHERE user_id = ?", (lim, uid))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ Лимит пользователя {uid} = {lim}")
+    except:
+        bot.reply_to(message, "❌ Ошибка")
+
+# ============ ЗАПУСК ============
 if __name__ == "__main__":
-    print("""
-    ╔══════════════════════════════════════╗
-    ║     🕵️ OSINT BOT STARTING...        ║
-    ║     PIDORI GROUP SUPPORT SYSTEM     ║
-    ╚══════════════════════════════════════╝
-    """)
-    
+    print("🕵️ OSINT BOT STARTING...")
     init_database()
-    logger.info("Bot starting...")
     
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=60)
         except Exception as e:
-            logger.error(f"Bot polling error: {e}")
+            logger.error(f"Polling error: {e}")
             time.sleep(15)
