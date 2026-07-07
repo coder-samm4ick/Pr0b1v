@@ -1,999 +1,1051 @@
+# app.py - Основной файл ебучего сайта
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-OSINT Telegram Bot с реальным парсингом данных.
-Парсит публичные источники и возвращает найденную информацию.
+PIDORI OSINT WEB - Поиск по слитым базам
+Веб-интерфейс для пробива по всем критериям
 """
 
-import telebot
-from telebot import types
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 import sqlite3
-import requests
-from bs4 import BeautifulSoup
-import json
-import re
 import os
+import re
+import json
+import csv
 import hashlib
 import time
-import threading
 from datetime import datetime, timedelta
-from fake_useragent import UserAgent
+from fuzzywuzzy import fuzz
 import phonenumbers
-from phonenumbers import geocoder, carrier, timezone
-import whois
-import dns.resolver
-import socket
-import ssl
-import logging
-from urllib.parse import urlparse, quote_plus, unquote
-import random
+from phonenumbers import geocoder, carrier
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+import threading
+import queue
+import pandas as pd
 
 # ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = "8796975931:AAFpT2nZUXWyqohYmdAwlK3C54B9klJkjK0"
-ADMIN_IDS = [8563327706]
-DB_NAME = "osint_bot.db"
-TEMP_DIR = "temp_files"
-LOG_FILE = "bot_operations.log"
+app = Flask(__name__)
+app.secret_key = 'PIDORI_OSINT_SECRET_KEY_MOTHERFUCKER'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///osint_users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 ua = UserAgent()
+DATA_DIR = 'leaked_databases'
+os.makedirs(DATA_DIR, exist_ok=True)
 
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+# ============ МОДЕЛИ БД ============
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    is_blocked = db.Column(db.Boolean, default=False)
+    requests_today = db.Column(db.Integer, default=0)
+    total_requests = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_request = db.Column(db.DateTime)
 
-# ============ БАЗА ДАННЫХ ============
-def init_database():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            requests_count INTEGER DEFAULT 0,
-            blocked BOOLEAN DEFAULT 0,
-            access_level INTEGER DEFAULT 1,
-            daily_limit INTEGER DEFAULT 50,
-            notes TEXT
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS requests_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            query_type TEXT,
-            query_text TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            result_summary TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS search_cache (
-            query_hash TEXT PRIMARY KEY,
-            query_type TEXT,
-            query_text TEXT,
-            result_data TEXT,
-            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+class SearchLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    query_type = db.Column(db.String(50))
+    query_text = db.Column(db.String(500))
+    result_count = db.Column(db.Integer)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    ip_address = db.Column(db.String(50))
 
-# ============ ОСНОВНОЙ КЛАСС ПОИСКА ============
-class OSINTSearcher:
+# ============ ИНИЦИАЛИЗАЦИЯ ============
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin:
+            return jsonify({'error': 'Доступ запрещен'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+def check_rate_limit(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if current_user.is_authenticated:
+            today = datetime.utcnow().date()
+            if current_user.last_request and current_user.last_request.date() != today:
+                current_user.requests_today = 0
+            
+            limit = 100 if current_user.is_admin else 50
+            if current_user.requests_today >= limit:
+                return jsonify({'error': f'Лимит запросов ({limit}) исчерпан'}), 429
+            
+            current_user.requests_today += 1
+            current_user.total_requests += 1
+            current_user.last_request = datetime.utcnow()
+            db.session.commit()
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ============ РАБОТА С БАЗАМИ ============
+class DatabaseManager:
+    """Менеджер слитых баз данных"""
+    
     def __init__(self):
-        self.session = requests.Session()
-        self.cache = {}
+        self.databases = {}
+        self.load_all_databases()
     
-    def _get_headers(self):
-        return {
-            'User-Agent': ua.random,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-        }
+    def load_all_databases(self):
+        """Загрузка всех баз из папки"""
+        for filename in os.listdir(DATA_DIR):
+            if filename.endswith(('.db', '.sqlite', '.sqlite3')):
+                self.load_sqlite(filename)
+            elif filename.endswith('.csv'):
+                self.load_csv(filename)
     
-    def _safe_request(self, url, timeout=10, retries=2):
-        for attempt in range(retries):
-            try:
-                resp = self.session.get(url, headers=self._get_headers(), timeout=timeout)
-                return resp
-            except Exception as e:
-                if attempt == retries - 1:
-                    return None
-                time.sleep(1)
-        return None
+    def load_sqlite(self, filename):
+        """Загрузка SQLite базы"""
+        try:
+            path = os.path.join(DATA_DIR, filename)
+            conn = sqlite3.connect(path)
+            cursor = conn.cursor()
+            
+            # Получаем все таблицы
+            tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            
+            for (table,) in tables:
+                # Получаем структуру таблицы
+                columns = [col[1] for col in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+                
+                db_key = f"{filename}_{table}"
+                self.databases[db_key] = {
+                    'type': 'sqlite',
+                    'path': path,
+                    'table': table,
+                    'columns': columns,
+                    'conn': conn
+                }
+        except Exception as e:
+            print(f"Ошибка загрузки {filename}: {e}")
     
-    def search_phone(self, phone):
-        """Реальный поиск по номеру телефона"""
-        results = {}
-        
-        clean_phone = re.sub(r'[^\d]', '', phone)
-        if len(clean_phone) == 11 and clean_phone.startswith('8'):
-            clean_phone = '7' + clean_phone[1:]
-        if len(clean_phone) == 10 and clean_phone.startswith('9'):
-            clean_phone = '7' + clean_phone
-        
+    def load_csv(self, filename):
+        """Загрузка CSV базы"""
         try:
-            parsed = phonenumbers.parse('+' + clean_phone, 'RU')
-            results['Страна'] = geocoder.description_for_number(parsed, 'ru')
-            results['Регион'] = geocoder.description_for_number(parsed, 'ru')
-            results['Оператор'] = carrier.name_for_number(parsed, 'ru')
-            results['Часовой пояс'] = ', '.join(timezone.time_zones_for_number(parsed))
-            results['Тип номера'] = 'Мобильный' if phonenumbers.number_type(parsed) == 1 else 'Стационарный'
-            results['Валидный'] = 'Да' if phonenumbers.is_valid_number(parsed) else 'Нет'
-        except:
-            results['Ошибка'] = 'Не удалось определить'
+            path = os.path.join(DATA_DIR, filename)
+            df = pd.read_csv(path, encoding='utf-8-sig', low_memory=False)
+            
+            db_key = filename.replace('.csv', '')
+            self.databases[db_key] = {
+                'type': 'csv',
+                'path': path,
+                'dataframe': df,
+                'columns': df.columns.tolist()
+            }
+        except Exception as e:
+            print(f"Ошибка загрузки {filename}: {e}")
+    
+    def search_all(self, query, search_type='auto'):
+        """Поиск по всем базам"""
+        results = []
         
-        # Поиск в телефонных справочниках
-        code = clean_phone[1:4] if len(clean_phone) > 3 else ''
-        number = clean_phone[4:] if len(clean_phone) > 4 else clean_phone
-        
-        # Парсинг who-calling.ru
-        try:
-            resp = self._safe_request(f'https://who-calling.ru/nomer/{clean_phone}')
-            if resp and resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                comments = soup.find_all('div', class_='comment-text')
-                if comments:
-                    results['Отзывы (who-calling)'] = [c.text.strip()[:200] for c in comments[:5]]
-                category = soup.find('span', class_='label-category')
-                if category:
-                    results['Категория номера'] = category.text.strip()
-        except:
-            pass
-        
-        # Поиск в Google (первые результаты)
-        try:
-            resp = self._safe_request(f'https://www.google.com/search?q={quote_plus("+" + clean_phone)}&hl=ru')
-            if resp and resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                snippets = soup.find_all('div', class_='VwiC3b')
-                if snippets:
-                    results['Упоминания в Google'] = [s.text[:150] for s in snippets[:5]]
-        except:
-            pass
-        
-        results['Telegram'] = f'https://t.me/+{clean_phone}'
-        results['WhatsApp'] = f'https://wa.me/{clean_phone}'
+        for db_name, db_info in self.databases.items():
+            if db_info['type'] == 'sqlite':
+                results.extend(self.search_sqlite(db_info, query, search_type))
+            elif db_info['type'] == 'csv':
+                results.extend(self.search_csv(db_info, query, search_type))
         
         return results
+    
+    def search_sqlite(self, db_info, query, search_type):
+        """Поиск в SQLite базе"""
+        results = []
+        conn = db_info['conn']
+        table = db_info['table']
+        columns = db_info['columns']
+        
+        # Определяем колонки для поиска
+        search_columns = self.get_search_columns(columns, search_type)
+        
+        for col in search_columns:
+            try:
+                # Прямой поиск
+                sql = f"SELECT * FROM {table} WHERE CAST({col} AS TEXT) LIKE ? LIMIT 50"
+                rows = conn.execute(sql, (f'%{query}%',)).fetchall()
+                
+                for row in rows:
+                    result = dict(zip(columns, row))
+                    result['source'] = f"{db_info['path']}::{table}::{col}"
+                    results.append(result)
+            except:
+                continue
+        
+        return results
+    
+    def search_csv(self, db_info, query, search_type):
+        """Поиск в CSV базе"""
+        results = []
+        df = db_info['dataframe']
+        columns = db_info['columns']
+        
+        search_columns = self.get_search_columns(columns, search_type)
+        
+        for col in search_columns:
+            try:
+                # Поиск по колонке
+                mask = df[col].astype(str).str.contains(query, case=False, na=False)
+                matches = df[mask].head(50)
+                
+                for _, row in matches.iterrows():
+                    result = row.to_dict()
+                    result['source'] = f"{db_info['path']}::{col}"
+                    results.append(result)
+            except:
+                continue
+        
+        return results
+    
+    def get_search_columns(self, columns, search_type):
+        """Определение колонок для поиска по типу данных"""
+        column_patterns = {
+            'phone': ['phone', 'tel', 'mobile', 'телефон', 'мобильный', 'номер'],
+            'email': ['email', 'mail', 'почта', 'e-mail'],
+            'name': ['name', 'fio', 'фио', 'fullname', 'имя', 'фамилия'],
+            'passport': ['passport', 'паспорт', 'doc', 'document'],
+            'snils': ['snils', 'снилс'],
+            'inn': ['inn', 'инн'],
+            'address': ['address', 'адрес', 'city', 'город'],
+            'vin': ['vin', 'вин'],
+            'car': ['car', 'auto', 'авто', 'госномер', 'plate'],
+            'telegram': ['telegram', 'tg', 'ник', 'username'],
+        }
+        
+        if search_type == 'auto':
+            # Все возможные колонки
+            matched = []
+            for patterns in column_patterns.values():
+                for col in columns:
+                    col_lower = col.lower()
+                    if any(p in col_lower for p in patterns):
+                        matched.append(col)
+            return list(set(matched)) if matched else columns
+        else:
+            patterns = column_patterns.get(search_type, [])
+            return [col for col in columns if any(p in col.lower() for p in patterns)]
+
+# ============ ОСНОВНОЙ ПОИСКОВИК ============
+class OSINTSearcher:
+    """Главный поисковый движок"""
+    
+    def __init__(self):
+        self.db_manager = DatabaseManager()
+    
+    def search(self, query, query_type='auto'):
+        """Универсальный поиск"""
+        results = {
+            'local_db': [],
+            'osint': {},
+            'social': {},
+            'summary': ''
+        }
+        
+        # 1. Поиск в локальных слитых базах
+        results['local_db'] = self.db_manager.search_all(query, query_type)
+        
+        # 2. OSINT поиск
+        if query_type == 'phone' or self.detect_phone(query):
+            results['osint'] = self.search_phone(query)
+        elif query_type == 'email' or self.detect_email(query):
+            results['osint'] = self.search_email(query)
+        elif query_type == 'vin' or self.detect_vin(query):
+            results['osint'] = self.search_vin(query)
+        elif query_type == 'car_plate' or self.detect_car_plate(query):
+            results['osint'] = self.search_car_plate(query)
+        elif query_type == 'domain' or self.detect_domain(query):
+            results['osint'] = self.search_domain(query)
+        
+        # 3. Соцсети
+        if query_type == 'username' or query.startswith('@'):
+            results['social'] = self.search_social(query)
+        
+        # 4. Сводка
+        results['summary'] = self.generate_summary(results)
+        
+        return results
+    
+    def detect_phone(self, text):
+        return bool(re.match(r'^(\+?[78])?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$', text.strip()))
+    
+    def detect_email(self, text):
+        return bool(re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text.strip()))
+    
+    def detect_vin(self, text):
+        return bool(re.match(r'^[A-HJ-NPR-Z0-9]{17}$', text.strip().upper()))
+    
+    def detect_car_plate(self, text):
+        return bool(re.match(r'^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$', text.strip().upper()))
+    
+    def detect_domain(self, text):
+        return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text.strip()))
+    
+    def search_phone(self, phone):
+        """Поиск по телефону"""
+        clean = re.sub(r'[^\d]', '', phone)
+        info = {}
+        
+        try:
+            parsed = phonenumbers.parse(f'+{clean}' if len(clean) > 10 else f'+7{clean[-10:]}', 'RU')
+            info['Страна'] = geocoder.description_for_number(parsed, 'ru')
+            info['Оператор'] = carrier.name_for_number(parsed, 'ru')
+            info['Тип'] = 'Мобильный' if phonenumbers.number_type(parsed) == 1 else 'Стационарный'
+        except:
+            pass
+        
+        return info
     
     def search_email(self, email):
         """Поиск по email"""
-        results = {}
-        
-        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-            return {'Ошибка': 'Некорректный email'}
-        
+        info = {}
         domain = email.split('@')[1]
-        username = email.split('@')[0]
         
-        # WHOIS домена
         try:
-            w = whois.whois(domain)
-            results['Домен зарегистрирован'] = str(w.creation_date)
-            results['Регистратор'] = w.registrar or 'Не указан'
-            results['Страна'] = w.country or 'Не указана'
+            # Проверка утечек
+            resp = requests.get(
+                f'https://haveibeenpwned.com/api/v3/breachedaccount/{email}?truncateResponse=true',
+                headers={'User-Agent': ua.random},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                info['Утечки'] = [b['Name'] for b in resp.json()[:10]]
+            elif resp.status_code == 404:
+                info['Утечки'] = 'Не найден'
         except:
-            results['WHOIS'] = 'Не удалось получить'
+            info['Утечки'] = 'Ошибка проверки'
         
-        # Проверка утечек через публичное API
-        try:
-            resp = self._safe_request(f'https://haveibeenpwned.com/api/v3/breachedaccount/{email}?truncateResponse=true')
-            if resp and resp.status_code == 200:
-                breaches = resp.json()
-                results['Найден в утечках'] = [b['Name'] for b in breaches[:10]]
-            elif resp and resp.status_code == 404:
-                results['Утечки'] = 'Не найден в известных утечках'
-        except:
-            results['Утечки'] = 'Не удалось проверить'
-        
-        # Gravatar
-        hash_md5 = hashlib.md5(email.lower().encode()).hexdigest()
-        results['Gravatar'] = f'https://www.gravatar.com/{hash_md5}'
-        
-        # Поиск в соцсетях
-        results['Facebook'] = f'https://www.facebook.com/search/people/?q={quote_plus(email)}'
-        results['LinkedIn'] = f'https://www.linkedin.com/search/results/people/?keywords={quote_plus(email)}'
-        results['VK'] = f'https://vk.com/search?c[email]={email}'
-        
-        # Проверка домена email
-        try:
-            mx_records = dns.resolver.resolve(domain, 'MX')
-            results['MX записи'] = [str(mx) for mx in mx_records]
-        except:
-            results['MX записи'] = 'Не найдены'
-        
-        return results
+        return info
     
     def search_vin(self, vin):
-        """Поиск по VIN номеру"""
-        results = {}
-        clean_vin = vin.upper().strip()
+        """Расшифровка VIN"""
+        vin = vin.upper()
+        info = {}
         
-        if not re.match(r'^[A-HJ-NPR-Z0-9]{17}$', clean_vin):
-            return {'Ошибка': 'Некорректный VIN'}
-        
-        # Расшифровка VIN
-        wmi = clean_vin[:3]
-        vds = clean_vin[3:9]
-        vis = clean_vin[9:17]
-        
-        # WMI справочник
         wmi_dict = {
-            'XTA': 'LADA (АвтоВАЗ)',
-            'XTB': 'АЗЛК/Москвич',
-            'XTC': 'КамАЗ',
-            'XTD': 'ЗАЗ',
-            'XTE': 'ГАЗ',
-            'XTH': 'АЗЛК',
-            'XTT': 'УАЗ',
-            'XTY': 'ИжМаш',
-            'ZAA': 'Alfa Romeo',
-            'ZFF': 'Ferrari',
-            'ZFA': 'Fiat',
-            'VF1': 'Renault',
-            'VF3': 'Peugeot',
-            'VF7': 'Citroen',
-            'WBA': 'BMW',
-            'WBS': 'BMW M',
-            'WDB': 'Mercedes-Benz',
-            'WDD': 'Mercedes-Benz',
-            'WAU': 'Audi',
-            'WVW': 'Volkswagen',
-            'WVG': 'Volkswagen',
-            '1HG': 'Honda USA',
-            'JHM': 'Honda Japan',
-            '1FT': 'Ford Truck',
-            '2FM': 'Ford Canada',
-            'JM1': 'Mazda',
-            'JN1': 'Nissan',
-            'JT2': 'Toyota',
-            'JS1': 'Suzuki',
-            'KMH': 'Hyundai',
-            'KNA': 'Kia',
+            'XTA': 'LADA (АвтоВАЗ)', 'XTE': 'ГАЗ', 'XTT': 'УАЗ',
+            'WBA': 'BMW', 'WDB': 'Mercedes-Benz', 'WAU': 'Audi',
+            'WVW': 'Volkswagen', 'JHM': 'Honda', 'JT2': 'Toyota',
+            'KMH': 'Hyundai', 'KNA': 'Kia', 'VF1': 'Renault',
         }
         
-        results['Производитель (WMI)'] = wmi_dict.get(wmi, f'Неизвестный код: {wmi}')
-        results['Модельный год'] = vis[0] if len(vis) > 0 else 'Не определен'
-        results['Завод-изготовитель'] = vis[1] if len(vis) > 1 else 'Не определен'
-        results['Серийный номер'] = vis[2:] if len(vis) > 2 else 'Не определен'
+        info['Производитель'] = wmi_dict.get(vin[:3], f'Код: {vin[:3]}')
+        info['Год'] = self.decode_vin_year(vin[9]) if len(vin) > 9 else '?'
         
-        # Год выпуска по VIN (10-й символ)
-        year_codes = {
-            'A': 2010, 'B': 2011, 'C': 2012, 'D': 2013, 'E': 2014,
-            'F': 2015, 'G': 2016, 'H': 2017, 'J': 2018, 'K': 2019,
-            'L': 2020, 'M': 2021, 'N': 2022, 'P': 2023, 'R': 2024,
-            'S': 2025, 'T': 2026, 'V': 2027, 'W': 2028, 'X': 2029
-        }
-        model_year_code = clean_vin[9] if len(clean_vin) > 9 else None
-        if model_year_code and model_year_code in year_codes:
-            results['Год выпуска'] = year_codes[model_year_code]
-        
-        results['Проверка ГИБДД'] = f'https://xn--90adear.xn--p1ai/check/auto?vin={clean_vin}'
-        results['Автотека'] = f'https://autoteka.ru/vin/{clean_vin}'
-        
-        return results
+        return info
+    
+    def decode_vin_year(self, code):
+        years = {'A': 2010, 'B': 2011, 'C': 2012, 'D': 2013, 'E': 2014,
+                 'F': 2015, 'G': 2016, 'H': 2017, 'J': 2018, 'K': 2019,
+                 'L': 2020, 'M': 2021, 'N': 2022, 'P': 2023, 'R': 2024}
+        return years.get(code.upper(), 'Неизвестно')
     
     def search_car_plate(self, plate):
-        """Поиск по госномеру"""
-        results = {}
-        clean_plate = re.sub(r'[^\w]', '', plate.upper())
+        """Информация о госномере"""
+        info = {}
+        clean = re.sub(r'[^\w]', '', plate.upper())
         
-        # Определение региона
-        region_match = re.search(r'(\d{2,3})$', clean_plate)
-        if region_match:
-            region_code = region_match.group(1)
-            regions = {
-                '77': 'Москва', '78': 'Санкт-Петербург', '50': 'Московская область',
-                '47': 'Ленинградская область', '23': 'Краснодарский край',
-                '16': 'Республика Татарстан', '66': 'Свердловская область',
-                '54': 'Новосибирская область', '61': 'Ростовская область',
-                '59': 'Пермский край', '74': 'Челябинская область',
-                '52': 'Нижегородская область', '63': 'Самарская область',
-                '55': 'Омская область', '34': 'Волгоградская область',
-                '02': 'Башкортостан', '116': 'Татарстан (новый)',
-                '799': 'Москва (новый)', '797': 'Москва (новый)',
-            }
-            results['Регион регистрации'] = regions.get(str(region_code), f'Код: {region_code}')
+        regions = {
+            '77': 'Москва', '78': 'СПб', '50': 'МО', '23': 'Краснодар',
+            '16': 'Татарстан', '02': 'Башкортостан', '66': 'Свердловская',
+        }
         
-        results['Проверка ГИБДД'] = f'https://xn--90adear.xn--p1ai/check/auto?regnum={clean_plate}'
-        results['Штрафы ГИБДД'] = f'https://гибдд.рф/check/fines?regnum={clean_plate}'
-        results['Автокод'] = f'https://avtokod.mos.ru/Login?returnUrl=%2f'
+        match = re.search(r'(\d{2,3})$', clean)
+        if match:
+            info['Регион'] = regions.get(match.group(1), f'Код: {match.group(1)}')
         
-        return results
+        return info
     
-    def search_social_media(self, username):
-        """Поиск профилей в соцсетях"""
+    def search_domain(self, domain):
+        """Информация о домене"""
+        info = {}
+        
+        try:
+            import whois
+            w = whois.whois(domain)
+            info['Регистратор'] = w.registrar or '?'
+            info['Создан'] = str(w.creation_date)[:10] if w.creation_date else '?'
+            info['Истекает'] = str(w.expiration_date)[:10] if w.expiration_date else '?'
+            info['Владелец'] = w.org or 'Скрыт'
+        except:
+            pass
+        
+        try:
+            import socket
+            info['IP'] = socket.gethostbyname(domain)
+        except:
+            pass
+        
+        return info
+    
+    def search_social(self, username):
+        """Поиск в соцсетях"""
         username = username.replace('@', '').strip()
         results = {}
         
         sites = {
-            'Instagram': {
-                'url': f'https://www.instagram.com/{username}/',
-                'check': True
-            },
-            'Twitter/X': {
-                'url': f'https://twitter.com/{username}',
-                'check': True
-            },
-            'GitHub': {
-                'url': f'https://github.com/{username}',
-                'check': True
-            },
-            'Reddit': {
-                'url': f'https://www.reddit.com/user/{username}',
-                'check': True
-            },
-            'TikTok': {
-                'url': f'https://www.tiktok.com/@{username}',
-                'check': True
-            },
-            'VK': {
-                'url': f'https://vk.com/{username}',
-                'check': True
-            },
-            'Telegram': {
-                'url': f'https://t.me/{username}',
-                'check': True
-            },
-            'YouTube': {
-                'url': f'https://www.youtube.com/@{username}',
-                'check': True
-            },
-            'Twitch': {
-                'url': f'https://www.twitch.tv/{username}',
-                'check': True
-            },
-            'Pinterest': {
-                'url': f'https://www.pinterest.com/{username}/',
-                'check': True
-            },
-            'Steam': {
-                'url': f'https://steamcommunity.com/id/{username}',
-                'check': True
-            },
-            'Spotify': {
-                'url': f'https://open.spotify.com/user/{username}',
-                'check': False
-            },
+            'VK': f'https://vk.com/{username}',
+            'Telegram': f'https://t.me/{username}',
+            'Instagram': f'https://instagram.com/{username}',
+            'Twitter': f'https://twitter.com/{username}',
+            'GitHub': f'https://github.com/{username}',
+            'TikTok': f'https://tiktok.com/@{username}',
+            'Reddit': f'https://reddit.com/user/{username}',
         }
         
-        for platform, data in sites.items():
-            if data['check']:
-                try:
-                    resp = self._safe_request(data['url'], timeout=5)
-                    if resp:
-                        if resp.status_code == 200:
-                            results[platform] = f'✅ Найден: {data["url"]}'
-                        elif resp.status_code == 404:
-                            results[platform] = '❌ Не найден'
-                        else:
-                            results[platform] = f'⚠️ Статус: {resp.status_code}'
-                except:
-                    results[platform] = '⚠️ Ошибка проверки'
-            else:
-                results[platform] = f'🔗 {data["url"]}'
+        for platform, url in sites.items():
+            try:
+                resp = requests.head(url, headers={'User-Agent': ua.random}, timeout=5)
+                if resp.status_code == 200:
+                    results[platform] = f'✅ Найден'
+                elif resp.status_code == 404:
+                    results[platform] = '❌ Не найден'
+            except:
+                results[platform] = '⚠️ Ошибка'
         
         return results
     
-    def search_domain(self, domain):
-        """Поиск информации о домене"""
-        results = {}
-        domain = domain.strip().lower()
+    def generate_summary(self, results):
+        """Генерация сводки"""
+        summary_parts = []
         
-        # WHOIS
-        try:
-            w = whois.whois(domain)
-            results['Регистратор'] = w.registrar or 'Не указан'
-            results['Дата создания'] = str(w.creation_date) if w.creation_date else 'Не указана'
-            results['Дата окончания'] = str(w.expiration_date) if w.expiration_date else 'Не указана'
-            results['Владелец'] = w.org or 'Скрыт'
-            results['Страна'] = w.country or 'Не указана'
-            results['NS серверы'] = ', '.join(w.name_servers) if w.name_servers else 'Не указаны'
-        except Exception as e:
-            results['WHOIS'] = f'Ошибка: {str(e)[:100]}'
-        
-        # DNS записи
-        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA']
-        for rtype in record_types:
-            try:
-                answers = dns.resolver.resolve(domain, rtype)
-                records = [str(a) for a in answers]
-                results[f'DNS {rtype}'] = ', '.join(records[:5])
-            except:
-                pass
-        
-        # IP адрес
-        try:
-            ip = socket.gethostbyname(domain)
-            results['IP адрес'] = ip
+        # Локальные базы
+        local_count = len(results.get('local_db', []))
+        if local_count > 0:
+            summary_parts.append(f'🔍 В локальных базах: {local_count} записей')
             
-            # Геолокация IP
-            try:
-                geo_resp = self._safe_request(f'http://ip-api.com/json/{ip}')
-                if geo_resp and geo_resp.status_code == 200:
-                    geo_data = geo_resp.json()
-                    results['Страна IP'] = geo_data.get('country', '?')
-                    results['Город'] = geo_data.get('city', '?')
-                    results['Провайдер'] = geo_data.get('isp', '?')
-            except:
-                pass
-        except:
-            results['IP адрес'] = 'Не удалось определить'
+            # Собираем ключевую информацию из найденных записей
+            for record in results['local_db'][:3]:
+                for key in ['ФИО', 'name', 'fio', 'адрес', 'address', 'паспорт', 'passport']:
+                    if key in record:
+                        summary_parts.append(f'  📌 {record[key]}')
+                        break
         
-        # SSL сертификат
-        try:
-            cert = ssl.get_server_certificate((domain, 443))
-            import OpenSSL
-            x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, cert)
-            results['SSL выдан'] = x509.get_issuer().CN
-            results['SSL для'] = x509.get_subject().CN
-            results['SSL действителен до'] = x509.get_notAfter().decode()[:8]
-        except:
-            results['SSL'] = 'Не удалось проверить'
+        # OSINT
+        if results.get('osint'):
+            for key, value in results['osint'].items():
+                if isinstance(value, list):
+                    summary_parts.append(f'📋 {key}: {len(value)}')
+                else:
+                    summary_parts.append(f'📋 {key}: {value}')
         
-        # Заголовки сервера
-        try:
-            resp = self._safe_request(f'https://{domain}', timeout=5)
-            if resp:
-                server = resp.headers.get('Server', '')
-                if server:
-                    results['Сервер'] = server
-                powered = resp.headers.get('X-Powered-By', '')
-                if powered:
-                    results['Технология'] = powered
-        except:
-            pass
+        # Соцсети
+        social_found = sum(1 for v in results.get('social', {}).values() if '✅' in str(v))
+        if social_found > 0:
+            summary_parts.append(f'👤 Профилей найдено: {social_found}')
         
-        return results
-    
-    def search_ip(self, ip):
-        """Поиск информации об IP"""
-        results = {}
-        
-        # Геолокация
-        try:
-            geo_resp = self._safe_request(f'http://ip-api.com/json/{ip}')
-            if geo_resp and geo_resp.status_code == 200:
-                geo = geo_resp.json()
-                results['Страна'] = geo.get('country', '?')
-                results['Город'] = geo.get('city', '?')
-                results['Регион'] = geo.get('regionName', '?')
-                results['Провайдер'] = geo.get('isp', '?')
-                results['Организация'] = geo.get('org', '?')
-                results['Координаты'] = f"{geo.get('lat', '?')}, {geo.get('lon', '?')}"
-                results['Часовой пояс'] = geo.get('timezone', '?')
-        except:
-            pass
-        
-        # Reverse DNS
-        try:
-            rdns = socket.gethostbyaddr(ip)
-            results['RDNS'] = rdns[0]
-        except:
-            results['RDNS'] = 'Не определен'
-        
-        # Проверка черных списков
-        try:
-            reversed_ip = '.'.join(reversed(ip.split('.')))
-            bl_resp = self._safe_request(f'https://{reversed_ip}.zen.spamhaus.org', timeout=3)
-            if bl_resp:
-                results['Spamhaus'] = '🚫 В черном списке!'
-            else:
-                results['Spamhaus'] = '✅ Чистый'
-        except:
-            pass
-        
-        return results
-    
-    def search_person(self, full_name, birth_date=None):
-        """Поиск информации о человеке"""
-        results = {}
-        
-        parts = full_name.split()
-        surname = parts[0] if parts else ''
-        name = parts[1] if len(parts) > 1 else ''
-        
-        results['Поисковый запрос'] = full_name
-        
-        # Поиск в Google
-        query = f'"{full_name}"'
-        if birth_date:
-            query += f' "{birth_date}"'
-        
-        try:
-            resp = self._safe_request(f'https://www.google.com/search?q={quote_plus(query)}&hl=ru')
-            if resp and resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                snippets = soup.find_all('div', class_='VwiC3b')
-                if snippets:
-                    results['Упоминания в Google'] = [s.text[:200] for s in snippets[:5]]
-        except:
-            pass
-        
-        # Ссылки на соцсети
-        if surname and name:
-            results['VK поиск'] = f'https://vk.com/search?c[name]=1&c[q]={quote_plus(full_name)}'
-            results['OK поиск'] = f'https://ok.ru/dk?st.cmd=searchResult&st.query={quote_plus(full_name)}'
-            results['Facebook поиск'] = f'https://www.facebook.com/search/people/?q={quote_plus(full_name)}'
-        
-        # Судебные дела
-        results['Судебные дела'] = f'https://sudact.ru/regular/?q={quote_plus(full_name)}'
-        
-        # Исполнительные производства
-        results['ФССП'] = f'https://fssp.gov.ru/iss/ip/search?query={quote_plus(full_name)}'
-        
-        # ЕГРЮЛ/ЕГРИП
-        results['Налоговая'] = f'https://egrul.nalog.ru/index.html?q={quote_plus(surname)}+{quote_plus(name) if name else ""}'
-        
-        return results
-    
-    def search_document(self, doc_type, doc_number):
-        """Поиск по документам"""
-        results = {}
-        clean_number = re.sub(r'[^\d]', '', doc_number)
-        
-        if doc_type == 'passport':
-            results['Тип документа'] = 'Паспорт РФ'
-            results['Серия'] = clean_number[:4] if len(clean_number) >= 4 else clean_number
-            results['Номер'] = clean_number[4:] if len(clean_number) > 4 else ''
-            results['Проверка ФМС'] = f'https://services.fms.gov.ru/info-service.htm?sid=2000&number={clean_number}'
-        elif doc_type == 'snils':
-            results['Тип документа'] = 'СНИЛС'
-            results['Номер'] = f'{clean_number[:3]}-{clean_number[3:6]}-{clean_number[6:9]} {clean_number[9:11]}' if len(clean_number) >= 11 else clean_number
-            results['ПФР'] = 'https://www.pfr.gov.ru/order/request/'
-        elif doc_type == 'inn':
-            results['Тип документа'] = 'ИНН'
-            results['Номер'] = clean_number
-            if len(clean_number) == 12:
-                results['Тип'] = 'ИНН физического лица'
-            elif len(clean_number) == 10:
-                results['Тип'] = 'ИНН юридического лица'
-            results['Проверка ФНС'] = f'https://egrul.nalog.ru/index.html?q={clean_number}'
-        elif doc_type == 'driver_license':
-            results['Тип документа'] = 'Водительское удостоверение'
-            results['Номер'] = clean_number
-            results['Проверка ГИБДД'] = f'https://гибдд.рф/check/driver#license_number={clean_number}'
-        
-        return results
-    
-    def search_company(self, inn):
-        """Поиск компании по ИНН"""
-        results = {}
-        clean_inn = re.sub(r'[^\d]', '', inn)
-        
-        results['ИНН'] = clean_inn
-        
-        # Парсинг rusprofile.ru
-        try:
-            resp = self._safe_request(f'https://www.rusprofile.ru/search?query={clean_inn}')
-            if resp and resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                # Название компании
-                title = soup.find('h1', class_='company-name')
-                if title:
-                    results['Название'] = title.text.strip()
-                
-                # Директор
-                director = soup.find('div', class_='company-director')
-                if director:
-                    results['Руководитель'] = director.text.strip().replace('Руководитель', '').strip()
-                
-                # Адрес
-                address = soup.find('div', class_='company-address')
-                if address:
-                    results['Адрес'] = address.text.strip()
-                
-                # Статус
-                status = soup.find('div', class_='company-status')
-                if status:
-                    results['Статус'] = status.text.strip()
-        except:
-            pass
-        
-        # Альтернативные источники
-        results['СБИС'] = f'https://sbis.ru/contragents/{clean_inn}'
-        results['List-Org'] = f'https://www.list-org.com/search?val={clean_inn}'
-        results['ЕГРЮЛ'] = f'https://egrul.nalog.ru/index.html?q={clean_inn}'
-        
-        return results
-    
-    def search_cadastral(self, cad_number):
-        """Поиск по кадастровому номеру"""
-        results = {}
-        clean_number = re.sub(r'[^\d:.]', '', cad_number)
-        
-        parts = clean_number.split(':')
-        if len(parts) >= 2:
-            results['Кадастровый округ'] = parts[0]
-            results['Кадастровый район'] = parts[1] if len(parts) > 1 else '?'
-            results['Кадастровый квартал'] = parts[2] if len(parts) > 2 else '?'
-            results['Номер участка'] = parts[3] if len(parts) > 3 else '?'
-        
-        results['Публичная кадастровая карта'] = f'https://pkk.rosreestr.ru/#/search/{clean_number}'
-        results['ЕГРП 365'] = f'https://egrp365.ru/map/?kad={clean_number}'
-        
-        return results
+        return '\n'.join(summary_parts) if summary_parts else 'Ничего не найдено'
 
-# ============ ФУНКЦИИ БОТА ============
+# ============ ИНИЦИАЛИЗАЦИЯ ПОИСКОВИКА ============
 searcher = OSINTSearcher()
 
-def log_request(user_id, query_type, query_text, result_summary=""):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO requests_log (user_id, query_type, query_text, result_summary) VALUES (?, ?, ?, ?)",
-            (user_id, query_type, query_text[:500], result_summary[:500])
-        )
-        cursor.execute(
-            "UPDATE users SET requests_count = requests_count + 1 WHERE user_id = ?",
-            (user_id,)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Log error: {e}")
+# ============ МАРШРУТЫ ============
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return render_template('dashboard.html')
+    return redirect(url_for('login'))
 
-def format_results(results):
-    """Форматирование результатов для Telegram"""
-    text = ""
-    for key, value in results.items():
-        if isinstance(value, list):
-            text += f"\n<b>{key}:</b>\n"
-            for item in value[:5]:
-                text += f"  • {item}\n"
-        elif isinstance(value, str) and value.startswith('http'):
-            text += f"🔗 <a href='{value}'>{key}</a>\n"
-        else:
-            text += f"<b>{key}:</b> {value}\n"
-    return text
-
-def detect_query_type(text):
-    """Определение типа запроса"""
-    text = text.strip()
-    
-    patterns = [
-        ('phone', r'^(\+?[78])?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$'),
-        ('email', r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
-        ('vin', r'^[A-HJ-NPR-Z0-9]{17}$'),
-        ('car_plate', r'^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$'),
-        ('domain', r'^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
-        ('ip', r'^(\d{1,3}\.){3}\d{1,3}$'),
-        ('cadastral', r'^\d{2}:\d{2}:\d{7}:\d+$'),
-        ('username', r'^@[a-zA-Z0-9_\.]+$'),
-    ]
-    
-    for qtype, pattern in patterns:
-        if re.match(pattern, text, re.IGNORECASE):
-            return qtype
-    
-    words = text.split()
-    if len(words) >= 2 and all(w[0].isupper() for w in words if w.isalpha()):
-        has_date = any(re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', w) for w in words)
-        if has_date or len(words) >= 3:
-            return 'person'
-    
-    return 'general'
-
-@bot.message_handler(commands=['start'])
-def start_command(message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
-        (user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-    )
-    
-    blocked = cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    conn.commit()
-    conn.close()
-    
-    if blocked and blocked[0]:
-        bot.reply_to(message, "⛔️ Доступ заблокирован.")
-        return
-    
-    welcome = """
-🕵️ <b>OSINT Search Bot</b> — поиск информации в открытых источниках.
-
-<b>Что можно искать:</b>
-
-👤 <b>Человек:</b> <code>Фамилия Имя Отчество ДД.ММ.ГГГГ</code>
-
-📱 <b>Телефон:</b> <code>79991234567</code>
-📧 <b>Email:</b> <code>user@example.com</code>
-
-🚗 <b>Авто:</b>
-• VIN: <code>XTA211440C5106924</code>
-• Номер: <code>А123ВС199</code>
-
-🌐 <b>Интернет:</b>
-• Домен: <code>example.com</code>
-• IP: <code>1.1.1.1</code>
-• Профиль: <code>@username</code>
-
-📄 <b>Документы:</b>
-• Паспорт: <code>/passport 1234567890</code>
-• СНИЛС: <code>/snils 12345678901</code>
-• ИНН: <code>/inn 123456789012</code>
-• Права: <code>/vu 1234567890</code>
-
-🏢 <b>Компания:</b> <code>/company 7707083893</code>
-🏠 <b>Кадастр:</b> <code>77:01:0004042:6987</code>
-
-/admin — панель администратора
-"""
-    bot.reply_to(message, welcome)
-
-@bot.message_handler(commands=['admin'])
-def admin_command(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
-        types.InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
-        types.InlineKeyboardButton("📋 Логи", callback_data="admin_logs"),
-        types.InlineKeyboardButton("🚫 Блокировки", callback_data="admin_blocks"),
-    )
-    bot.send_message(message.chat.id, "🔐 <b>Админ-панель</b>", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
-def admin_callback(call):
-    if call.from_user.id not in ADMIN_IDS:
-        return
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    if call.data == "admin_stats":
-        total_users = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_requests = cursor.execute("SELECT COUNT(*) FROM requests_log").fetchone()[0]
-        blocked = cursor.execute("SELECT COUNT(*) FROM users WHERE blocked = 1").fetchone()[0]
-        active_24h = cursor.execute(
-            "SELECT COUNT(DISTINCT user_id) FROM requests_log WHERE timestamp > datetime('now', '-1 day')"
-        ).fetchone()[0]
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
         
-        stats = f"""
-📊 <b>Статистика:</b>
-👥 Пользователей: {total_users}
-🟢 Активных за 24ч: {active_24h}
-📈 Всего запросов: {total_requests}
-🚫 Заблокировано: {blocked}
-"""
-        bot.edit_message_text(stats, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
+        user = User.query.filter_by(username=username).first()
+        
+        if user and check_password_hash(user.password, password):
+            if user.is_blocked:
+                return render_template('login.html', error='Аккаунт заблокирован')
+            login_user(user)
+            return redirect(url_for('index'))
+        
+        return render_template('login.html', error='Неверные данные')
     
-    elif call.data == "admin_users":
-        users = cursor.execute("SELECT user_id, username, first_name, requests_count, blocked FROM users ORDER BY requests_count DESC LIMIT 20").fetchall()
-        text = "👥 <b>Топ пользователей:</b>\n\n"
-        for u in users:
-            status = "🚫" if u[4] else "✅"
-            text += f"{status} <code>{u[0]}</code> {u[2] or '?'} (@{u[1] or 'нет'}) — {u[3]} запросов\n"
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
-    
-    elif call.data == "admin_logs":
-        logs = cursor.execute(
-            "SELECT user_id, query_type, query_text, timestamp FROM requests_log ORDER BY timestamp DESC LIMIT 15"
-        ).fetchall()
-        text = "📋 <b>Последние запросы:</b>\n\n"
-        for log in logs:
-            text += f"🕐 {log[3][:16]} | 👤 {log[0]} | {log[1]}: {log[2][:80]}\n"
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
-    
-    elif call.data == "admin_blocks":
-        blocked_users = cursor.execute("SELECT user_id, username, notes FROM users WHERE blocked = 1").fetchall()
-        if blocked_users:
-            text = "🚫 <b>Заблокированные:</b>\n\n"
-            for u in blocked_users:
-                text += f"<code>{u[0]}</code> @{u[1] or 'нет'} — {u[2] or 'без причины'}\n"
-        else:
-            text = "Нет заблокированных пользователей"
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=call.message.reply_markup, parse_mode='HTML')
-    
-    conn.close()
+    return render_template('login.html')
 
-@bot.message_handler(commands=['passport', 'snils', 'inn', 'vu'])
-def doc_commands(message):
-    cmd = message.text.split()
-    if len(cmd) < 2:
-        bot.reply_to(message, "❌ Укажите номер документа")
-        return
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        invite_code = request.form.get('invite_code')
+        
+        # Проверка инвайт-кода (хуй зарегится без него)
+        valid_codes = ['PIDORI2024', 'OSINT_ACCESS', 'admin_invite_1337']
+        if invite_code not in valid_codes:
+            return render_template('register.html', error='Неверный инвайт-код')
+        
+        if User.query.filter_by(username=username).first():
+            return render_template('register.html', error='Пользователь уже существует')
+        
+        user = User(
+            username=username,
+            password=generate_password_hash(password),
+            is_admin=(invite_code == 'admin_invite_1337')
+        )
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        login_user(user)
+        return redirect(url_for('index'))
     
-    doc_map = {'/passport': 'passport', '/snils': 'snils', '/inn': 'inn', '/vu': 'driver_license'}
-    doc_type = doc_map.get(cmd[0])
-    doc_num = cmd[1]
-    
-    log_request(message.from_user.id, doc_type, doc_num)
-    
-    bot.send_chat_action(message.chat.id, 'typing')
-    results = searcher.search_document(doc_type, doc_num)
-    response = f"📄 <b>Результаты поиска ({doc_type.upper()}):</b>\n{format_results(results)}"
-    bot.reply_to(message, response, disable_web_page_preview=True)
+    return render_template('register.html')
 
-@bot.message_handler(commands=['company'])
-def company_command(message):
-    inn = message.text.replace('/company', '').strip()
-    if not inn:
-        bot.reply_to(message, "❌ Укажите ИНН компании")
-        return
-    
-    log_request(message.from_user.id, 'company', inn)
-    
-    bot.send_chat_action(message.chat.id, 'typing')
-    results = searcher.search_company(inn)
-    response = f"🏢 <b>Результаты поиска компании:</b>\n{format_results(results)}"
-    bot.reply_to(message, response, disable_web_page_preview=True)
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
 
-@bot.message_handler(content_types=['photo'])
-def photo_handler(message):
-    bot.reply_to(message, """
-🔍 <b>Поиск по фото:</b>
+@app.route('/search', methods=['POST'])
+@login_required
+@check_rate_limit
+def search():
+    query = request.json.get('query', '').strip()
+    query_type = request.json.get('type', 'auto')
+    
+    if not query:
+        return jsonify({'error': 'Введите запрос'}), 400
+    
+    # Логирование
+    log = SearchLog(
+        user_id=current_user.id,
+        query_type=query_type,
+        query_text=query,
+        ip_address=request.remote_addr
+    )
+    
+    try:
+        results = searcher.search(query, query_type)
+        log.result_count = len(results.get('local_db', []))
+        log.timestamp = datetime.utcnow()
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'type': query_type,
+            'results': results,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        log.result_count = 0
+        return jsonify({'error': f'Ошибка поиска: {str(e)}'}), 500
+    finally:
+        db.session.add(log)
+        db.session.commit()
 
-Загрузите фото на эти сервисы:
-
-📌 <a href='https://pimeyes.com'>PimEyes</a> — поиск лиц
-📌 <a href='https://tineye.com'>TinEye</a> — обратный поиск изображений
-📌 <a href='https://yandex.ru/images/search'>Яндекс.Картинки</a>
-📌 <a href='https://images.google.com'>Google Images</a>
-""", disable_web_page_preview=True)
-
-@bot.message_handler(func=lambda m: True)
-def universal_handler(message):
-    text = message.text.strip()
-    user_id = message.from_user.id
+@app.route('/admin')
+@login_required
+@admin_required
+def admin_panel():
+    users = User.query.all()
+    logs = SearchLog.query.order_by(SearchLog.timestamp.desc()).limit(100).all()
     
-    # Проверка блокировки
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    blocked = cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    
-    if blocked and blocked[0]:
-        bot.reply_to(message, "⛔️ Доступ заблокирован")
-        conn.close()
-        return
-    
-    # Проверка лимита
-    count = cursor.execute(
-        "SELECT COUNT(*) FROM requests_log WHERE user_id = ? AND timestamp > datetime('now', '-1 day')",
-        (user_id,)
-    ).fetchone()[0]
-    
-    limit = cursor.execute("SELECT daily_limit FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    daily_limit = limit[0] if limit else 50
-    conn.close()
-    
-    if count >= daily_limit:
-        bot.reply_to(message, f"⚠️ Дневной лимит ({daily_limit}) исчерпан")
-        return
-    
-    query_type = detect_query_type(text)
-    
-    bot.send_chat_action(message.chat.id, 'typing')
-    
-    search_map = {
-        'phone': searcher.search_phone,
-        'email': searcher.search_email,
-        'vin': searcher.search_vin,
-        'car_plate': searcher.search_car_plate,
-        'domain': searcher.search_domain,
-        'ip': searcher.search_ip,
-        'username': searcher.search_social_media,
-        'cadastral': searcher.search_cadastral,
+    stats = {
+        'total_users': User.query.count(),
+        'total_searches': SearchLog.query.count(),
+        'blocked_users': User.query.filter_by(is_blocked=True).count(),
+        'admins': User.query.filter_by(is_admin=True).count(),
     }
     
-    if query_type == 'person':
-        parts = text.split()
-        name_parts = []
-        birth_date = None
-        for part in parts:
-            if re.match(r'\d{2}[\.-]\d{2}[\.-]\d{4}', part):
-                birth_date = part
-            else:
-                name_parts.append(part)
-        results = searcher.search_person(' '.join(name_parts), birth_date)
-    elif query_type in search_map:
-        results = search_map[query_type](text)
-    else:
-        results = {
-            'Google': f'https://www.google.com/search?q={quote_plus(text)}',
-            'Яндекс': f'https://yandex.ru/search/?text={quote_plus(text)}',
+    return render_template('admin.html', users=users, logs=logs, stats=stats)
+
+@app.route('/admin/user/<int:user_id>/block', methods=['POST'])
+@login_required
+@admin_required
+def block_user(user_id):
+    user = User.query.get(user_id)
+    if user:
+        user.is_blocked = not user.is_blocked
+        db.session.commit()
+        return jsonify({'success': True, 'blocked': user.is_blocked})
+    return jsonify({'error': 'Пользователь не найден'}), 404
+
+@app.route('/admin/user/<int:user_id>/limit', methods=['POST'])
+@login_required
+@admin_required
+def set_user_limit(user_id):
+    user = User.query.get(user_id)
+    if user:
+        limit = request.json.get('limit', 50)
+        # Сохраняем лимит в сессии или БД
+        return jsonify({'success': True, 'limit': limit})
+    return jsonify({'error': 'Пользователь не найден'}), 404
+
+@app.route('/admin/databases')
+@login_required
+@admin_required
+def list_databases():
+    databases = []
+    for db_name, db_info in searcher.db_manager.databases.items():
+        databases.append({
+            'name': db_name,
+            'type': db_info['type'],
+            'columns': db_info['columns'][:10],
+            'size': os.path.getsize(db_info['path']) if 'path' in db_info else 0
+        })
+    return jsonify(databases)
+
+@app.route('/admin/reload')
+@login_required
+@admin_required
+def reload_databases():
+    global searcher
+    searcher = OSINTSearcher()
+    return jsonify({'success': True, 'message': 'Базы перезагружены'})
+
+@app.route('/api/export/<format>')
+@login_required
+@admin_required
+def export_data(format):
+    """Экспорт логов"""
+    logs = SearchLog.query.all()
+    data = [{
+        'user_id': log.user_id,
+        'query_type': log.query_type,
+        'query_text': log.query_text,
+        'timestamp': log.timestamp.isoformat(),
+        'result_count': log.result_count
+    } for log in logs]
+    
+    if format == 'json':
+        return jsonify(data)
+    elif format == 'csv':
+        import io
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=data[0].keys())
+        writer.writeheader()
+        writer.writerows(data)
+        return send_file(
+            io.BytesIO(output.getvalue().encode('utf-8')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name='search_logs.csv'
+        )
+    
+    return jsonify({'error': 'Неверный формат'}), 400
+
+# ============ HTML ШАБЛОНЫ ============
+HTML_TEMPLATES = {
+    'login.html': '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PIDORI OSINT - Вход</title>
+    <meta charset="utf-8">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0a; color: #00ff00; font-family: 'Courier New', monospace; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        .container { background: #111; border: 2px solid #00ff00; padding: 40px; border-radius: 10px; width: 400px; box-shadow: 0 0 20px rgba(0,255,0,0.3); }
+        h1 { text-align: center; margin-bottom: 30px; font-size: 24px; text-shadow: 0 0 10px #00ff00; }
+        input { width: 100%; padding: 12px; margin: 10px 0; background: #000; border: 1px solid #00ff00; color: #00ff00; font-family: inherit; border-radius: 5px; }
+        button { width: 100%; padding: 12px; background: #00ff00; color: #000; border: none; font-weight: bold; font-family: inherit; cursor: pointer; border-radius: 5px; margin-top: 10px; }
+        button:hover { background: #00cc00; }
+        .error { color: #ff0000; text-align: center; margin-top: 10px; }
+        a { color: #00ff00; text-decoration: none; display: block; text-align: center; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🕵️ PIDORI OSINT</h1>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Логин" required>
+            <input type="password" name="password" placeholder="Пароль" required>
+            <button type="submit">ВОЙТИ</button>
+        </form>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <a href="{{ url_for('register') }}">Регистрация</a>
+    </div>
+</body>
+</html>
+''',
+    
+    'register.html': '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PIDORI OSINT - Регистрация</title>
+    <meta charset="utf-8">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0a; color: #00ff00; font-family: 'Courier New', monospace; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        .container { background: #111; border: 2px solid #00ff00; padding: 40px; border-radius: 10px; width: 400px; }
+        h1 { text-align: center; margin-bottom: 30px; }
+        input { width: 100%; padding: 12px; margin: 10px 0; background: #000; border: 1px solid #00ff00; color: #00ff00; font-family: inherit; border-radius: 5px; }
+        button { width: 100%; padding: 12px; background: #00ff00; color: #000; border: none; font-weight: bold; cursor: pointer; border-radius: 5px; }
+        .error { color: #ff0000; text-align: center; margin-top: 10px; }
+        a { color: #00ff00; text-decoration: none; display: block; text-align: center; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Регистрация</h1>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Логин" required>
+            <input type="password" name="password" placeholder="Пароль" required>
+            <input type="text" name="invite_code" placeholder="Инвайт-код" required>
+            <button type="submit">ЗАРЕГИСТРИРОВАТЬСЯ</button>
+        </form>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <a href="{{ url_for('login') }}">Вход</a>
+    </div>
+</body>
+</html>
+''',
+    
+    'dashboard.html': '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PIDORI OSINT - Поиск</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0a; color: #00ff00; font-family: 'Courier New', monospace; min-height: 100vh; }
+        .header { background: #111; border-bottom: 2px solid #00ff00; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 20px; }
+        .header a { color: #00ff00; text-decoration: none; margin-left: 20px; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
+        .search-box { background: #111; border: 2px solid #00ff00; padding: 30px; border-radius: 10px; margin-bottom: 20px; }
+        .search-box input { width: 100%; padding: 15px; background: #000; border: 1px solid #00ff00; color: #00ff00; font-size: 16px; font-family: inherit; border-radius: 5px; }
+        .search-box select { padding: 15px; background: #000; border: 1px solid #00ff00; color: #00ff00; font-family: inherit; border-radius: 5px; margin-top: 10px; }
+        .examples { color: #666; font-size: 12px; margin-top: 10px; }
+        .examples code { color: #00cc00; }
+        .results { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .result-panel { background: #111; border: 1px solid #333; padding: 20px; border-radius: 10px; }
+        .result-panel h3 { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 15px; }
+        .result-item { padding: 10px; background: #0a0a0a; margin-bottom: 10px; border-left: 3px solid #00ff00; }
+        .result-item .key { color: #00cc00; font-weight: bold; }
+        .result-item .value { color: #ccc; }
+        .summary { background: #111; border: 2px solid #00ff00; padding: 20px; border-radius: 10px; margin-top: 20px; white-space: pre-wrap; }
+        .loading { text-align: center; padding: 50px; color: #666; }
+        .admin-link { color: #ff0; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🕵️ PIDORI OSINT v2.0</h1>
+        <div>
+            {% if current_user.is_admin %}
+            <a href="{{ url_for('admin_panel') }}" class="admin-link">[АДМИН]</a>
+            {% endif %}
+            <span>{{ current_user.username }}</span>
+            <a href="{{ url_for('logout') }}">[ВЫХОД]</a>
+        </div>
+    </div>
+    
+    <div class="container">
+        <div class="search-box">
+            <input type="text" id="searchInput" placeholder="Введите запрос..." autofocus>
+            <select id="searchType">
+                <option value="auto">Автоопределение</option>
+                <option value="phone">Телефон</option>
+                <option value="email">Email</option>
+                <option value="name">ФИО</option>
+                <option value="passport">Паспорт</option>
+                <option value="snils">СНИЛС</option>
+                <option value="inn">ИНН</option>
+                <option value="vin">VIN</option>
+                <option value="car">Авто</option>
+                <option value="address">Адрес</option>
+                <option value="telegram">Telegram</option>
+                <option value="username">Соцсети</option>
+                <option value="domain">Домен/IP</option>
+            </select>
+            <div class="examples">
+                <b>Примеры:</b>
+                <code>79991234567</code> | 
+                <code>user@mail.ru</code> | 
+                <code>Иванов Иван 01.01.1990</code> |
+                <code>А123ВС199</code> |
+                <code>@username</code>
+            </div>
+        </div>
+        
+        <div id="results"></div>
+    </div>
+    
+    <script>
+        const searchInput = document.getElementById('searchInput');
+        const searchType = document.getElementById('searchType');
+        let searchTimeout;
+        
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            const query = this.value.trim();
+            
+            if (query.length >= 3) {
+                document.getElementById('results').innerHTML = '<div class="loading">🔍 Поиск...</div>';
+                
+                searchTimeout = setTimeout(() => {
+                    performSearch(query, searchType.value);
+                }, 500);
+            }
+        });
+        
+        searchType.addEventListener('change', function() {
+            const query = searchInput.value.trim();
+            if (query.length >= 3) {
+                performSearch(query, this.value);
+            }
+        });
+        
+        function performSearch(query, type) {
+            fetch('/search', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({query: query, type: type})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('results').innerHTML = `<div class="loading">❌ ${data.error}</div>`;
+                    return;
+                }
+                displayResults(data);
+            })
+            .catch(error => {
+                document.getElementById('results').innerHTML = `<div class="loading">❌ Ошибка: ${error}</div>`;
+            });
         }
+        
+        function displayResults(data) {
+            let html = '<div class="results">';
+            
+            // Локальная БД
+            html += '<div class="result-panel">';
+            html += '<h3>🗄️ Локальная база данных</h3>';
+            if (data.results.local_db && data.results.local_db.length > 0) {
+                data.results.local_db.forEach(record => {
+                    html += '<div class="result-item">';
+                    html += `<span class="key">Источник:</span> <span class="value">${record.source}</span><br>`;
+                    for (const [key, value] of Object.entries(record)) {
+                        if (key !== 'source' && value) {
+                            html += `<span class="key">${key}:</span> <span class="value">${value}</span><br>`;
+                        }
+                    }
+                    html += '</div>';
+                });
+            } else {
+                html += '<p style="color:#666">Нет данных в локальных базах</p>';
+            }
+            html += '</div>';
+            
+            // OSINT
+            html += '<div class="result-panel">';
+            html += '<h3>🌐 Открытые источники</h3>';
+            if (data.results.osint && Object.keys(data.results.osint).length > 0) {
+                for (const [key, value] of Object.entries(data.results.osint)) {
+                    html += '<div class="result-item">';
+                    if (Array.isArray(value)) {
+                        html += `<span class="key">${key}:</span><br>`;
+                        value.forEach(v => html += `<span class="value">  • ${v}</span><br>`);
+                    } else {
+                        html += `<span class="key">${key}:</span> <span class="value">${value}</span>`;
+                    }
+                    html += '</div>';
+                }
+            } else {
+                html += '<p style="color:#666">Нет данных из открытых источников</p>';
+            }
+            html += '</div>';
+            
+            // Соцсети
+            html += '<div class="result-panel">';
+            html += '<h3>👤 Социальные сети</h3>';
+            if (data.results.social && Object.keys(data.results.social).length > 0) {
+                for (const [platform, status] of Object.entries(data.results.social)) {
+                    html += `<div class="result-item"><span class="key">${platform}:</span> <span class="value">${status}</span></div>`;
+                }
+            } else {
+                html += '<p style="color:#666">Нет данных о соцсетях</p>';
+            }
+            html += '</div>';
+            
+            html += '</div>';
+            
+            // Сводка
+            if (data.results.summary) {
+                html += `<div class="summary">${data.results.summary}</div>`;
+            }
+            
+            document.getElementById('results').innerHTML = html;
+        }
+    </script>
+</body>
+</html>
+''',
     
-    log_request(user_id, query_type, text, str(results)[:500])
+    'admin.html': '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PIDORI OSINT - Админ-панель</title>
+    <meta charset="utf-8">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0a; color: #00ff00; font-family: 'Courier New', monospace; }
+        .header { background: #111; border-bottom: 2px solid #ff0; padding: 15px 30px; display: flex; justify-content: space-between; }
+        .header a { color: #00ff00; text-decoration: none; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #111; border: 1px solid #333; padding: 20px; text-align: center; border-radius: 5px; }
+        .stat-card h2 { font-size: 32px; color: #ff0; }
+        .panel { background: #111; border: 1px solid #333; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; }
+        th { color: #ff0; }
+        button { padding: 5px 15px; background: #333; color: #00ff00; border: 1px solid #00ff00; cursor: pointer; border-radius: 3px; }
+        button:hover { background: #00ff00; color: #000; }
+        .blocked { color: #ff0000; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔐 Админ-панель PIDORI OSINT</h1>
+        <a href="{{ url_for('index') }}">[НАЗАД]</a>
+    </div>
     
-    type_names = {
-        'phone': '📱 ТЕЛЕФОН', 'email': '📧 EMAIL', 'vin': '🚗 VIN',
-        'car_plate': '🚘 ГОСНОМЕР', 'domain': '🌐 ДОМЕН', 'ip': '🔢 IP АДРЕС',
-        'username': '👤 СОЦСЕТИ', 'cadastral': '🏠 КАДАСТР', 'person': '👤 ЧЕЛОВЕК',
-        'general': '🔍 ПОИСК'
-    }
+    <div class="container">
+        <div class="stats">
+            <div class="stat-card">
+                <div>Пользователей</div>
+                <h2>{{ stats.total_users }}</h2>
+            </div>
+            <div class="stat-card">
+                <div>Поисков</div>
+                <h2>{{ stats.total_searches }}</h2>
+            </div>
+            <div class="stat-card">
+                <div>Заблокировано</div>
+                <h2>{{ stats.blocked_users }}</h2>
+            </div>
+            <div class="stat-card">
+                <div>Админов</div>
+                <h2>{{ stats.admins }}</h2>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <h3>👥 Пользователи</h3>
+            <table>
+                <tr>
+                    <th>ID</th>
+                    <th>Логин</th>
+                    <th>Запросов</th>
+                    <th>Статус</th>
+                    <th>Действия</th>
+                </tr>
+                {% for user in users %}
+                <tr class="{{ 'blocked' if user.is_blocked }}">
+                    <td>{{ user.id }}</td>
+                    <td>{{ user.username }}</td>
+                    <td>{{ user.total_requests }}</td>
+                    <td>{{ '🚫 Заблокирован' if user.is_blocked else '✅ Активен' }}</td>
+                    <td>
+                        <button onclick="toggleBlock({{ user.id }})">
+                            {{ 'Разблокировать' if user.is_blocked else 'Заблокировать' }}
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        
+        <div class="panel">
+            <h3>📋 Последние запросы</h3>
+            <table>
+                <tr>
+                    <th>Время</th>
+                    <th>Пользователь</th>
+                    <th>Тип</th>
+                    <th>Запрос</th>
+                    <th>Результатов</th>
+                </tr>
+                {% for log in logs %}
+                <tr>
+                    <td>{{ log.timestamp.strftime('%H:%M:%S') }}</td>
+                    <td>{{ log.user_id }}</td>
+                    <td>{{ log.query_type }}</td>
+                    <td>{{ log.query_text[:100] }}</td>
+                    <td>{{ log.result_count }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        
+        <button onclick="reloadDB()">🔄 Перезагрузить базы</button>
+        <a href="/api/export/json" style="color:#00ff00">📥 Экспорт JSON</a>
+        <a href="/api/export/csv" style="color:#00ff00">📥 Экспорт CSV</a>
+    </div>
     
-    response = f"<b>Результаты поиска ({type_names.get(query_type, query_type.upper())}):</b>\n{format_results(results)}"
-    response += f"\n<i>🕐 {datetime.now().strftime('%H:%M:%S')}</i>"
-    
-    bot.reply_to(message, response, disable_web_page_preview=True)
+    <script>
+        function toggleBlock(userId) {
+            fetch(`/admin/user/${userId}/block`, {method: 'POST'})
+                .then(r => r.json())
+                .then(data => location.reload());
+        }
+        
+        function reloadDB() {
+            fetch('/admin/reload')
+                .then(r => r.json())
+                .then(data => alert(data.message));
+        }
+    </script>
+</body>
+</html>
+'''
+}
 
-# ============ АДМИН КОМАНДЫ ============
-@bot.message_handler(commands=['block'])
-def block_user(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ /block [user_id]")
-        return
-    try:
-        uid = int(parts[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (uid,))
-        conn.commit()
-        conn.close()
-        bot.reply_to(message, f"✅ Пользователь {uid} заблокирован")
-    except:
-        bot.reply_to(message, "❌ Ошибка")
-
-@bot.message_handler(commands=['unblock'])
-def unblock_user(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "❌ /unblock [user_id]")
-        return
-    try:
-        uid = int(parts[1])
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (uid,))
-        conn.commit()
-        conn.close()
-        bot.reply_to(message, f"✅ Пользователь {uid} разблокирован")
-    except:
-        bot.reply_to(message, "❌ Ошибка")
-
-@bot.message_handler(commands=['limit'])
-def set_limit(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.reply_to(message, "❌ /limit [user_id] [число]")
-        return
-    try:
-        uid = int(parts[1])
-        lim = int(parts[2])
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("UPDATE users SET daily_limit = ? WHERE user_id = ?", (lim, uid))
-        conn.commit()
-        conn.close()
-        bot.reply_to(message, f"✅ Лимит пользователя {uid} = {lim}")
-    except:
-        bot.reply_to(message, "❌ Ошибка")
+# ============ СОЗДАНИЕ ШАБЛОНОВ ============
+os.makedirs('templates', exist_ok=True)
+for filename, content in HTML_TEMPLATES.items():
+    with open(f'templates/{filename}', 'w', encoding='utf-8') as f:
+        f.write(content)
 
 # ============ ЗАПУСК ============
-if __name__ == "__main__":
-    print("🕵️ OSINT BOT STARTING...")
-    init_database()
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        
+        # Создаем админа если нет
+        if not User.query.filter_by(username='admin').first():
+            admin = User(
+                username='admin',
+                password=generate_password_hash('admin123'),
+                is_admin=True
+            )
+            db.session.add(admin)
+            db.session.commit()
+            print("✅ Админ создан: admin / admin123")
     
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=0, timeout=60)
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(15)
+    print("""
+    ╔══════════════════════════════════════╗
+    ║     🕵️ PIDORI OSINT WEB v2.0        ║
+    ║     http://localhost:5000            ║
+    ║     admin / admin123                 ║
+    ╚══════════════════════════════════════╝
+    """)
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
