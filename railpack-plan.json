@@ -1,0 +1,11 @@
+{
+  "build": {
+    "python": {
+      "version": "3.11.10",
+      "install": "system"
+    }
+  },
+  "run": {
+    "command": "python bot.py"
+  }
+}
